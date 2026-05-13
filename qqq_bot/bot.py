@@ -43,9 +43,13 @@ async def _send_signal_to_channel(bot: Bot, app: AppState, decision: SignalDecis
         html.escape(f"Close={close:.4f}" if isinstance(close, (int, float)) else "Close=n/a"),
         html.escape(f"RSI({s.rsi_period})={rsi_v:.2f} (BUY<{s.rsi_buy:.1f}, SELL>{s.rsi_sell:.1f})") if isinstance(
             rsi_v, (int, float)) else html.escape(f"RSI({s.rsi_period})=n/a"),
-        html.escape(f"EMA{s.ema_fast}={ema_f:.2f} | EMA{s.ema_slow}={ema_sl:.2f}") if ... else html.escape("EMA=n/a"),
-        html.escape(f"BB({s.bb_period},{s.bb_std}): L={bb_l:.2f} M={bb_m:.2f} U={bb_u:.2f}") if ... else html.escape(
-            "BB=n/a"),
+        html.escape(f"EMA{s.ema_fast}={ema_f:.2f} | EMA{s.ema_slow}={ema_sl:.2f}")
+        if isinstance(ema_f, (int, float)) and isinstance(ema_sl, (int, float))
+        else html.escape("EMA=n/a"),
+
+        html.escape(f"BB({s.bb_period},{s.bb_std}): L={bb_l:.2f} M={bb_m:.2f} U={bb_u:.2f}")
+        if isinstance(bb_l, (int, float)) and isinstance(bb_m, (int, float)) and isinstance(bb_u, (int, float))
+        else html.escape("BB=n/a"),
         "",
         f"<i>{html.escape(decision.reason)}</i>",
     ]
