@@ -326,10 +326,10 @@ async def bootstrap_history(app: AppState) -> None:
             bars = await asyncio.wait_for(
                 app.tn.get_hloc(
                     symbol=cfg.symbol,
-                    timeframe=tf,
+                    timeframe_minutes=tf,
                     count=-int(need),
-                    date_from=date_from,
-                    date_to=date_to,
+                    date_from_utc=date_from,
+                    date_to_utc=date_to,
                 ),
                 timeout=cfg.tradernet_timeout_seconds + 5,
             )
