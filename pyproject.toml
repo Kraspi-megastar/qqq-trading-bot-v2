@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# Базовый набор: ошибки/потенциальные баги/импорты/обновления синтаксиса
+select = ["E", "F", "I", "B", "UP"]
+
+# Если хочешь строгую длину строк — убери E501 из ignore
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["qqq_bot"]
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+# Мягкий старт: не требуем аннотации у каждой функции
+disallow_untyped_defs = false
+
+# Рекомендуется, чтобы mypy не “взрывался” на сторонних либах
+follow_imports = "silent"
