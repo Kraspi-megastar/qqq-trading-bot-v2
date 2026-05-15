@@ -51,12 +51,44 @@ def _build_model(model_name: str):
 
 
 def _best_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, float]:
+    if len(y_true) == 0 or len(set(y_true.astype(int))) < 2:
+        return 0.5, 0.0
     precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
     if len(thresholds) == 0:
         return 0.5, 0.0
     f1_scores = 2 * precision[:-1] * recall[:-1] / np.maximum(precision[:-1] + recall[:-1], 1e-9)
     idx = int(np.nanargmax(f1_scores))
     return float(thresholds[idx]), float(f1_scores[idx])
+
+
+def _metric_auc(metric_fn, y_true, y_prob):
+    y_true = pd.Series(y_true).astype(int)
+    if len(y_true) == 0 or len(set(y_true)) < 2:
+        return None
+    return float(metric_fn(y_true, y_prob))
+
+
+def _safe_report(y_true, y_prob, threshold: float) -> str:
+    y_true = pd.Series(y_true).astype(int)
+    if len(y_true) == 0:
+        return "No rows in split."
+    pred = (np.asarray(y_prob) >= threshold).astype(int)
+    return classification_report(y_true, pred, digits=4, zero_division=0)
+
+
+def _validate_target(ds_frame: pd.DataFrame, target_column: str, target_mode: str) -> None:
+    n = len(ds_frame)
+    counts = ds_frame[target_column].astype(int).value_counts().sort_index().to_dict()
+    if n < 30:
+        raise RuntimeError(
+            f"Too few rows for training after filtering: {n}. "
+            f"Target counts={counts}. For target_mode={target_mode!r}, collect more history/signals first."
+        )
+    if len(counts) < 2:
+        raise RuntimeError(
+            f"Training target has only one class. Rows={n}, counts={counts}. "
+            "Change target_horizon/target_threshold or collect more data."
+        )
 
 
 def train_model(
@@ -69,6 +101,7 @@ def train_model(
     only_regular_session: bool = True,
 ) -> dict[str, Any]:
     bars = pd.read_parquet(input_path) if input_path.endswith(".parquet") else pd.read_csv(input_path)
+
     ds = prepare_training_dataset(
         bars=bars,
         target_mode=target_mode,
@@ -78,10 +111,24 @@ def train_model(
         only_regular_session=only_regular_session,
     )
 
+    print("Training rows after filtering:", len(ds.frame))
+    print("Target counts:", ds.frame[ds.target_column].astype(int).value_counts().sort_index().to_dict())
+    if "base_signal" in ds.frame.columns:
+        print("Base signals:", ds.frame["base_signal"].astype(str).value_counts().to_dict())
+
+    _validate_target(ds.frame, ds.target_column, target_mode)
+
     train, valid, test = split_train_valid_test(ds.frame)
 
+    # If chronological valid/test split is too small, still train, but metrics will be advisory only.
     X_train = train[ds.feature_columns]
     y_train = train[ds.target_column].astype(int)
+
+    if len(set(y_train)) < 2:
+        raise RuntimeError(
+            f"Training split has only one class: {y_train.value_counts().sort_index().to_dict()}. "
+            "Need more history or a less sparse signal set."
+        )
 
     X_valid = valid[ds.feature_columns]
     y_valid = valid[ds.target_column].astype(int)
@@ -92,8 +139,8 @@ def train_model(
     model = _build_model(model_name)
     model.fit(X_train, y_train)
 
-    valid_prob = model.predict_proba(X_valid)[:, 1]
-    test_prob = model.predict_proba(X_test)[:, 1]
+    valid_prob = model.predict_proba(X_valid)[:, 1] if len(valid) else np.array([])
+    test_prob = model.predict_proba(X_test)[:, 1] if len(test) else np.array([])
 
     threshold, best_f1 = _best_threshold(y_valid.to_numpy(), valid_prob)
 
@@ -112,22 +159,24 @@ def train_model(
         "target_horizon": target_horizon,
         "target_threshold": target_threshold,
         "threshold": threshold,
-        "valid_roc_auc": float(roc_auc_score(y_valid, valid_prob)) if len(set(y_valid)) > 1 else None,
-        "valid_pr_auc": float(average_precision_score(y_valid, valid_prob)) if len(set(y_valid)) > 1 else None,
-        "test_roc_auc": float(roc_auc_score(y_test, test_prob)) if len(set(y_test)) > 1 else None,
-        "test_pr_auc": float(average_precision_score(y_test, test_prob)) if len(set(y_test)) > 1 else None,
+        "valid_roc_auc": _metric_auc(roc_auc_score, y_valid, valid_prob),
+        "valid_pr_auc": _metric_auc(average_precision_score, y_valid, valid_prob),
+        "test_roc_auc": _metric_auc(roc_auc_score, y_test, test_prob),
+        "test_pr_auc": _metric_auc(average_precision_score, y_test, test_prob),
         "best_valid_f1": best_f1,
+        "n_total": int(len(ds.frame)),
         "n_train": int(len(train)),
         "n_valid": int(len(valid)),
         "n_test": int(len(test)),
+        "target_counts_total": {str(k): int(v) for k, v in ds.frame[ds.target_column].astype(int).value_counts().sort_index().items()},
     }
 
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print("=== VALID report @ threshold {:.4f} ===".format(threshold))
-    print(classification_report(y_valid, (valid_prob >= threshold).astype(int), digits=4))
+    print(_safe_report(y_valid, valid_prob, threshold))
     print("=== TEST report @ threshold {:.4f} ===".format(threshold))
-    print(classification_report(y_test, (test_prob >= threshold).astype(int), digits=4))
+    print(_safe_report(y_test, test_prob, threshold))
     print(json.dumps(metadata, indent=2, ensure_ascii=False))
 
     return metadata

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-from typing import Literal
-
 import numpy as np
 import pandas as pd
+
+
+def _as_series(df: pd.DataFrame, col: str, default=None) -> pd.Series:
+    """Return a single Series even if df has duplicated column names."""
+    if col not in df.columns:
+        return pd.Series([default] * len(df), index=df.index)
+    value = df[col]
+    if isinstance(value, pd.DataFrame):
+        value = value.iloc[:, 0]
+    return value
 
 
 def make_directional_labels(
@@ -12,7 +20,12 @@ def make_directional_labels(
     threshold: float = 0.0015,
 ) -> pd.DataFrame:
     out = df.copy()
-    future_ret = out["close"].shift(-horizon) / out["close"] - 1.0
+    if out.columns.duplicated().any():
+        out = out.loc[:, ~out.columns.duplicated(keep="first")].copy()
+
+    close = pd.to_numeric(_as_series(out, "close"), errors="coerce")
+    future_ret = close.shift(-horizon) / close - 1.0
+
     out["future_ret"] = future_ret
     out["target_up"] = (future_ret > threshold).astype(int)
     out["target_down"] = (future_ret < -threshold).astype(int)
@@ -26,9 +39,14 @@ def make_signal_quality_label(
     threshold: float = 0.0015,
 ) -> pd.DataFrame:
     out = make_directional_labels(df, horizon=horizon, threshold=threshold)
-    signal = out[base_signal_col].astype(str).str.upper().fillna("HOLD")
+
+    signal = _as_series(out, base_signal_col, default="HOLD")
+    signal = signal.astype(str).str.upper().fillna("HOLD")
 
     out["target_signal_quality"] = 0
-    out.loc[signal.eq("BUY"), "target_signal_quality"] = out.loc[signal.eq("BUY"), "target_up"]
-    out.loc[signal.eq("SELL"), "target_signal_quality"] = out.loc[signal.eq("SELL"), "target_down"]
+    buy_mask = signal.eq("BUY")
+    sell_mask = signal.eq("SELL")
+
+    out.loc[buy_mask, "target_signal_quality"] = out.loc[buy_mask, "target_up"]
+    out.loc[sell_mask, "target_signal_quality"] = out.loc[sell_mask, "target_down"]
     return out
