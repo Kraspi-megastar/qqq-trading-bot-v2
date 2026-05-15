@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, time
 from zoneinfo import ZoneInfo
+from typing import Any
 import asyncio
 import pandas as pd
 
@@ -38,6 +39,11 @@ class AppState:
 
     strategy_id: int = 1
     strategy2: Strategy2Runtime = field(default_factory=Strategy2Runtime)
+
+    # Optional ML advisory/filter layer. Set in bot.py after AppState creation.
+    ml_service: Any | None = None
+    last_ml_decision: Any | None = None
+    last_ml_decision_ts: datetime | None = None
 
     def set_strategy(self, strategy_id: int) -> None:
         sid = int(strategy_id)
@@ -379,6 +385,61 @@ def _cooldown_active(app: AppState) -> tuple[bool, int]:
     left = int((app.stats.last_signal_sent_at + timedelta(seconds=cd) - now).total_seconds())
     return (left > 0), max(left, 0)
 
+def _bars_for_ml(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "timestamp" not in out.columns and "ts" in out.columns:
+        out = out.rename(columns={"ts": "timestamp"})
+
+    keep_cols = [
+        "timestamp",
+        "open", "high", "low", "close", "volume",
+        "rsi", "ema9", "ema21",
+        "ema_fast", "ema_slow",
+        "bb_lower", "bb_mid", "bb_upper",
+        "atr", "vwap",
+    ]
+
+    existing = [c for c in keep_cols if c in out.columns]
+    return out[existing].copy()
+
+
+def _infer_session_label(ts_utc: datetime | None, tz_name: str) -> str:
+    if ts_utc is None:
+        return "unknown"
+    if ts_utc.tzinfo is None:
+        ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+    local = ts_utc.astimezone(ZoneInfo(tz_name))
+    t = local.timetz().replace(tzinfo=None)
+    if time(9, 30) <= t < time(16, 0):
+        return "regular"
+    if time(4, 0) <= t < time(9, 30):
+        return "premarket"
+    if time(16, 0) <= t < time(20, 0):
+        return "afterhours"
+    return "closed"
+
+
+def _ml_strategy_context(app: AppState, decision: SignalDecision, sig_ts: datetime | None = None) -> dict:
+    details = dict(getattr(decision, "details", {}) or {})
+
+    ctx = {
+        "symbol": app.cfg.symbol,
+        "timeframe": f"{app.cfg.timeframe_minutes}m",
+        "timeframe_minutes": float(app.cfg.timeframe_minutes),
+        "session": _infer_session_label(sig_ts, app.cfg.display_tz),
+        "strategy_id": int(getattr(app, "strategy_id", 1)),
+    }
+
+    for k, v in details.items():
+        if isinstance(v, bool):
+            ctx[k] = int(v)
+        elif isinstance(v, (int, float, str)):
+            ctx[k] = v
+        elif v is None:
+            ctx[k] = None
+
+    return ctx
 
 async def polling_loop(app: AppState, send_signal_cb) -> None:
     cfg = app.cfg
@@ -457,6 +518,38 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                         strategy_id=app.strategy_id,
                         runtime_state=app.strategy2,
                     )
+            # 3b) ML advisory/filter layer on the latest CLOSED bar.
+            # Evaluate once per closed bar, not on every polling tick.
+            try:
+                ml_service = getattr(app, "ml_service", None)
+
+                if ml_service is not None and len(df_sig) > 0:
+                    ml_ts = df_sig["ts"].iloc[-1] if "ts" in df_sig.columns else None
+                    if not isinstance(ml_ts, datetime):
+                        ml_ts = pd.to_datetime(ml_ts, utc=True, errors="coerce")
+                        ml_ts = ml_ts.to_pydatetime() if pd.notna(ml_ts) else None
+
+                    if ml_ts is not None and getattr(app, "last_ml_decision_ts", None) != ml_ts:
+                        ml_decision = ml_service.decide(
+                            bars=_bars_for_ml(df_sig),
+                            base_signal=decision.action,
+                            strategy_context=_ml_strategy_context(app, decision, sig_ts=ml_ts),
+                            current_position=getattr(app.strategy2, "position", "FLAT"),
+                        )
+
+                        app.last_ml_decision = ml_decision
+                        app.last_ml_decision_ts = ml_ts
+
+                    ml_decision = getattr(app, "last_ml_decision", None)
+                    if ml_decision is not None and getattr(ml_decision, "final_signal", decision.action) != decision.action:
+                        decision = SignalDecision(
+                            action=ml_decision.final_signal,
+                            reason=f"{decision.reason} | ML: {ml_decision.reason}",
+                            details=getattr(decision, "details", {}) or {},
+                        )
+
+            except Exception as e:
+                app.stats.last_error = f"ml_decide: {repr(e)}"
 
             # 4) build "regular" chart.png (for /chart etc.)
             chart_path = cfg.cache_dir / "chart.png"
