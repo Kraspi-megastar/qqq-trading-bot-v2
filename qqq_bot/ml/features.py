@@ -213,8 +213,28 @@ def latest_feature_row(
     feature_columns: Optional[list[str]] = None,
     strategy_context: Optional[Dict[str, object]] = None,
 ) -> pd.DataFrame:
-    feature_columns = feature_columns or DEFAULT_FEATURES
+    """Return the latest feature row in the exact model feature order.
+
+    Live and training frames can differ slightly: some historical training
+    columns (for example synthetic/detail_* diagnostics) may be absent in
+    the live dataframe. Missing model columns are intentionally filled with
+    0.0 so the advisory ML layer never breaks the base trading bot.
+    """
+    feature_columns = list(dict.fromkeys(feature_columns or DEFAULT_FEATURES))
+
     feats = build_feature_frame(df, strategy_context=strategy_context)
-    row = feats[feature_columns].tail(1).copy()
+
+    # Safety guard against duplicated names from mixed training/live frames.
+    if feats.columns.duplicated().any():
+        feats = feats.loc[:, ~feats.columns.duplicated(keep="first")].copy()
+
+    # Keep exact training-time feature order, but tolerate absent live columns.
+    row = feats.reindex(columns=feature_columns, fill_value=0.0).tail(1).copy()
+
+    # sklearn expects numeric model inputs. Any non-numeric/missing values are
+    # converted to 0.0 rather than raising inside the live bot loop.
+    for col in row.columns:
+        row[col] = pd.to_numeric(row[col], errors="coerce")
+
     row = row.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return row
