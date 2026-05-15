@@ -4,155 +4,137 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-import numpy as np
+import matplotlib.pyplot as plt
 import pandas as pd
 
 
 def plot_chart(
     df: pd.DataFrame,
-    out_path: str | Path,
-    title: str = "",
-    current_action: str | None = None,
+    output_path: str | Path,
+    title: str,
+    last_signal: str | None = None,
     signal_history: list[tuple[str, object]] | None = None,  # [(BUY/SELL, ts), ...]
+    max_signals: int = 6,
 ) -> None:
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
     if df is None or len(df) == 0:
-        fig = plt.figure(figsize=(12, 6))
-        plt.title(title or "chart")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return
+        raise ValueError("plot_chart: empty dataframe")
 
-    d = df.copy()
+    out = df.copy()
 
-    ts = pd.to_datetime(d.get("ts"), utc=True, errors="coerce")
-    ts_iso = ts.dt.strftime("%Y-%m-%dT%H:%M:%SZ").fillna("")
-    x = np.arange(len(d))
+    if "ts" not in out.columns:
+        raise ValueError("plot_chart: dataframe must contain 'ts' column")
 
-    close = pd.to_numeric(d.get("close"), errors="coerce")
-    ema_fast = pd.to_numeric(d.get("ema_fast"), errors="coerce")
-    ema_slow = pd.to_numeric(d.get("ema_slow"), errors="coerce")
-    ema_trend = pd.to_numeric(d.get("ema_trend"), errors="coerce")  # EMA200 для страт#2
+    out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+    out = out.dropna(subset=["ts"]).reset_index(drop=True)
 
-    bb_u = pd.to_numeric(d.get("bb_upper"), errors="coerce")
-    bb_m = pd.to_numeric(d.get("bb_mid"), errors="coerce")
-    bb_l = pd.to_numeric(d.get("bb_lower"), errors="coerce")
+    if len(out) == 0:
+        raise ValueError("plot_chart: dataframe has no valid ts values")
 
-    vwap = pd.to_numeric(d.get("vwap"), errors="coerce")
-    st = pd.to_numeric(d.get("supertrend"), errors="coerce")
+    # X-axis as bar index (so there are no visual session gaps)
+    out["_x"] = range(len(out))
 
-    rsi = pd.to_numeric(d.get("rsi"), errors="coerce")
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1,
+        figsize=(16, 8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
 
-    fig = plt.figure(figsize=(12, 6))
-    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
-    ax = fig.add_subplot(gs[0, 0])
-    ax_rsi = fig.add_subplot(gs[1, 0], sharex=ax)
+    # --- main price panel ---
+    ax1.plot(out["_x"], out["close"], label="Price")
 
-    # PRICE
-    ax.plot(x, close, linewidth=1.2, label="Price")
-    if ema_fast.notna().any():
-        ax.plot(x, ema_fast, linewidth=1.0, label="EMA fast")
-    if ema_slow.notna().any():
-        ax.plot(x, ema_slow, linewidth=1.0, label="EMA slow")
-    if ema_trend.notna().any():
-        ax.plot(x, ema_trend, linewidth=1.0, label="EMA trend")
+    if "ema_fast" in out.columns:
+        ax1.plot(out["_x"], out["ema_fast"], label="EMA fast")
+    if "ema_slow" in out.columns:
+        ax1.plot(out["_x"], out["ema_slow"], label="EMA slow")
+    if "ema_trend" in out.columns:
+        ax1.plot(out["_x"], out["ema_trend"], label="EMA trend")
 
-    if bb_u.notna().any():
-        ax.plot(x, bb_u, linewidth=0.9, label="BB upper")
-    if bb_m.notna().any():
-        ax.plot(x, bb_m, linewidth=0.9, label="BB mid")
-    if bb_l.notna().any():
-        ax.plot(x, bb_l, linewidth=0.9, label="BB lower")
+    if "bb_upper" in out.columns:
+        ax1.plot(out["_x"], out["bb_upper"], label="BB upper")
+    if "bb_mid" in out.columns:
+        ax1.plot(out["_x"], out["bb_mid"], label="BB mid")
+    if "bb_lower" in out.columns:
+        ax1.plot(out["_x"], out["bb_lower"], label="BB lower")
 
-    if vwap.notna().any():
-        ax.plot(x, vwap, linewidth=1.0, label="VWAP")
-    if st.notna().any():
-        ax.plot(x, st, linewidth=1.0, label="Supertrend")
+    if "vwap" in out.columns:
+        ax1.plot(out["_x"], out["vwap"], label="VWAP")
+    if "supertrend" in out.columns:
+        ax1.plot(out["_x"], out["supertrend"], label="Supertrend")
 
-    # SIGNAL MARKERS (triangles)
+    # --- signal markers ---
     if signal_history:
-        ts_to_idx = {ts_iso.iloc[i]: i for i in range(len(ts_iso)) if ts_iso.iloc[i]}
-        buy_x, buy_y, sell_x, sell_y = [], [], [], []
-        seen = set()
+        normalized = []
 
         for item in signal_history:
-            if not isinstance(item, (tuple, list)) or len(item) < 2:
-                continue
-
-            action = item[0]
-            ts_obj = item[1]
-            price_hint = item[2] if len(item) >= 3 else None
-
-            if action not in ("BUY", "SELL"):
-                continue
-
-            # ВОТ ОНО: ts_key определяем всегда
             try:
-                ts_key = pd.to_datetime(ts_obj, utc=True, errors="coerce").strftime("%Y-%m-%dT%H:%M:%SZ")
-            except Exception:
-                ts_key = ""
-
-            if not ts_key:
-                continue
-
-            idx = ts_to_idx.get(ts_key)
-            if idx is None:
-                continue
-
-            # y: если цена сохранена — используем её, иначе close бара
-            if isinstance(price_hint, (int, float)):
-                yv = float(price_hint)
-            else:
-                yv = close.iloc[idx]
-                if pd.isna(yv):
+                if not item or len(item) < 2:
                     continue
-                yv = float(yv)
-
-            k = (action, idx)
-            if k in seen:
+                action = str(item[0]).upper()
+                ts = pd.to_datetime(item[1], utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                if action not in ("BUY", "SELL"):
+                    continue
+                normalized.append((action, ts))
+            except Exception:
                 continue
-            seen.add(k)
+
+        # keep only signals inside visible time window
+        ts_min = out["ts"].iloc[0]
+        ts_max = out["ts"].iloc[-1]
+
+        normalized = [
+            (action, ts)
+            for action, ts in normalized
+            if ts_min <= ts <= ts_max
+        ]
+
+        # keep only last N signals
+        if max_signals > 0:
+            normalized = normalized[-max_signals:]
+
+        # draw markers by nearest bar
+        for action, sig_ts in normalized:
+            idx = (out["ts"] - sig_ts).abs().idxmin()
+            x = out.loc[idx, "_x"]
+            y = out.loc[idx, "close"]
 
             if action == "BUY":
-                buy_x.append(idx);
-                buy_y.append(yv)
+                ax1.scatter(x, y, marker="^", s=220, label=None)
             else:
-                sell_x.append(idx);
-                sell_y.append(yv)
+                ax1.scatter(x, y, marker="v", s=220, label=None)
 
-        if buy_x:
-            ax.scatter(buy_x, buy_y, marker="^", s=90, color="green", zorder=10)
-        if sell_x:
-            ax.scatter(sell_x, sell_y, marker="v", s=90, color="red", zorder=10)
+    ax1.set_title(f"{title} (bar-index {len(out)-1}, no session gaps)")
+    ax1.legend(loc="upper left")
+    ax1.grid(True, alpha=0.3)
 
-    # RSI
-    if rsi.notna().any():
-        ax_rsi.plot(x, rsi, linewidth=1.0)
-        ax_rsi.set_ylim(0, 100)
-        ax_rsi.axhline(30, linewidth=0.8)
-        ax_rsi.axhline(50, linewidth=0.8)
-        ax_rsi.axhline(70, linewidth=0.8)
-        ax_rsi.set_ylabel("RSI", fontsize=9)
+    # --- RSI panel ---
+    if "rsi" in out.columns:
+        ax2.plot(out["_x"], out["rsi"], label="RSI")
+        ax2.axhline(70, linewidth=1)
+        ax2.axhline(50, linewidth=1)
+        ax2.axhline(30, linewidth=1)
 
-    # X labels
-    n_ticks = 10
-    if len(x) > 1:
-        tick_pos = np.linspace(0, len(x) - 1, min(n_ticks, len(x))).astype(int)
-        tick_lbl = [ts_iso.iloc[i][5:16] if ts_iso.iloc[i] else "" for i in tick_pos]
-        ax_rsi.set_xticks(tick_pos)
-        ax_rsi.set_xticklabels(tick_lbl, rotation=0, fontsize=8)
+    ax2.set_ylabel("RSI")
+    ax2.set_ylim(0, 100)
+    ax2.grid(True, alpha=0.3)
 
-    bar_index = len(d) - 1
-    ax.set_title(f"{title} (bar-index {bar_index}, no session gaps)", fontsize=10)
+    # X labels from timestamps, but not every single bar
+    step = max(1, len(out) // 10)
+    tick_idx = list(range(0, len(out), step))
+    if tick_idx[-1] != len(out) - 1:
+        tick_idx.append(len(out) - 1)
 
-    ax.legend(loc="upper left", fontsize=8)
-    ax.grid(True, alpha=0.2)
-    ax_rsi.grid(True, alpha=0.2)
-    plt.setp(ax.get_xticklabels(), visible=False)
+    tick_labels = [
+        out.loc[i, "ts"].strftime("%m-%dT%H:%M")
+        for i in tick_idx
+    ]
 
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    ax2.set_xticks(tick_idx)
+    ax2.set_xticklabels(tick_labels, rotation=0)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120)
     plt.close(fig)
