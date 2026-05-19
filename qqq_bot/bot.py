@@ -26,6 +26,19 @@ try:
 except Exception:
     MLTradingService = None
 
+try:
+    from .options_signal import (
+        build_options_signal,
+        load_options_position,
+        option_signal_text_lines,
+        save_options_position,
+    )
+except Exception:
+    build_options_signal = None
+    load_options_position = None
+    option_signal_text_lines = None
+    save_options_position = None
+
 
 def _fmt_ts_z(dt) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt is not None else "-"
@@ -38,6 +51,43 @@ def _safe_float(value) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _load_ml_service():
+    if MLTradingService is None:
+        return None
+
+    try:
+        return MLTradingService.from_env()
+    except Exception:
+        return None
+
+
+def _load_options_position_safe(app: AppState):
+    if load_options_position is None:
+        return None
+
+    try:
+        return load_options_position(app.cfg.cache_dir, app.cfg.symbol)
+    except Exception as e:
+        try:
+            app.stats.last_error = f"load_options_position: {repr(e)}"
+        except Exception:
+            pass
+        return None
+
+
+def _save_options_position_safe(app: AppState, position) -> None:
+    if save_options_position is None:
+        return
+
+    try:
+        save_options_position(app.cfg.cache_dir, app.cfg.symbol, position)
+    except Exception as e:
+        try:
+            app.stats.last_error = f"save_options_position: {repr(e)}"
+        except Exception:
+            pass
 
 
 async def _send_signal_to_channel(
@@ -69,26 +119,23 @@ async def _send_signal_to_channel(
         f"<b>{html.escape(app.cfg.symbol)}</b> TF={app.cfg.timeframe_minutes}m",
         html.escape(f"BarTS={_fmt_ts_z(ts)}"),
         html.escape(f"Close={close:.4f}" if isinstance(close, (int, float)) else "Close=n/a"),
-
         html.escape(
             f"RSI({s.rsi_period})={rsi_v:.2f} "
             f"(BUY<{s.rsi_buy:.1f}, SELL>{s.rsi_sell:.1f})"
         )
         if isinstance(rsi_v, (int, float))
         else html.escape(f"RSI({s.rsi_period})=n/a"),
-
         html.escape(f"EMA{s.ema_fast}={ema_f:.2f} | EMA{s.ema_slow}={ema_sl:.2f}")
         if isinstance(ema_f, (int, float)) and isinstance(ema_sl, (int, float))
         else html.escape("EMA=n/a"),
-
         html.escape(f"BB({s.bb_period},{s.bb_std}): L={bb_l:.2f} M={bb_m:.2f} U={bb_u:.2f}")
         if isinstance(bb_l, (int, float)) and isinstance(bb_m, (int, float)) and isinstance(bb_u, (int, float))
         else html.escape("BB=n/a"),
-
         "",
         f"<i>{html.escape(decision.reason)}</i>",
     ]
 
+    # ML block.
     ml = getattr(app, "last_ml_decision", None)
     if ml is not None:
         long_prob = getattr(ml, "long_prob", None)
@@ -109,6 +156,27 @@ async def _send_signal_to_channel(
             ]
         )
 
+    # Smart QQQ options block.
+    option_signal = None
+    if build_options_signal is not None and option_signal_text_lines is not None:
+        try:
+            option_signal = build_options_signal(
+                symbol=app.cfg.symbol,
+                signal_action=decision.action,
+                spot=close,
+                bar_ts=ts,
+                tz_name=app.cfg.display_tz,
+                ml_decision=ml,
+                current_position=getattr(app, "options_position", None),
+            )
+
+            if option_signal is not None:
+                lines.extend(["", "<b>QQQ options block</b>"])
+                lines.extend([html.escape(line) for line in option_signal_text_lines(option_signal)])
+
+        except Exception as e:
+            app.stats.last_error = f"options_signal: {repr(e)}"
+
     caption = "\n".join(lines)
 
     await bot.send_photo(
@@ -117,15 +185,13 @@ async def _send_signal_to_channel(
         caption=caption,
     )
 
-
-def _load_ml_service():
-    if MLTradingService is None:
-        return None
-
-    try:
-        return MLTradingService.from_env()
-    except Exception:
-        return None
+    # Persist option position only after Telegram message was sent successfully.
+    if option_signal is not None:
+        try:
+            app.options_position = option_signal.next_position
+            _save_options_position_safe(app, app.options_position)
+        except Exception as e:
+            app.stats.last_error = f"options_position_after_send: {repr(e)}"
 
 
 async def _amain() -> None:
@@ -164,10 +230,14 @@ async def _amain() -> None:
         app = AppState(cfg=cfg, tn=tn, cache=cache, stats=stats)
         app.strategy_id = cfg.strategy_id
 
-        # ML advisory/filter layer. If ML is not installed or not configured,
-        # bot continues to work normally without blocking base signals.
+        # ML advisory/filter layer.
+        # If ML is not installed or not configured, bot continues to work normally.
         app.ml_service = ml_service
         app.last_ml_decision = None
+
+        # Smart options layer.
+        # Keeps option state separately from QQQ base strategy state.
+        app.options_position = _load_options_position_safe(app)
 
         dp["app"] = app
 
