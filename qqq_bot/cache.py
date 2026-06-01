@@ -44,6 +44,9 @@ class Stats:
 
     last_signal: str | None = None
     last_signal_ts: datetime | None = None           # timestamp бара (UTC)
+    last_signal_type: str | None = None              # OPEN_LONG/CLOSE_LONG/OPEN_SHORT/CLOSE_SHORT
+    last_signal_mode: str | None = None              # breakout/pullback/exit
+    last_signal_price: float | None = None
     last_signal_sent_at: datetime | None = None      # wall-clock UTC (когда отправили)
 
     # последние сигналы (пересчитанные по истории/кешу или полученные в real-time)

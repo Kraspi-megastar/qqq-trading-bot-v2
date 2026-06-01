@@ -15,6 +15,11 @@ from .tradernet import TraderNetClient
 from .scheduler import AppState, bootstrap_history, polling_loop
 from .handlers import router
 from .signals import SignalDecision
+from .options_signal import process_options_signal
+try:
+    from .ml.outcome_service import MLOutcomeService
+except Exception:  # ML deps/model are optional at runtime
+    MLOutcomeService = None
 
 
 def _fmt_ts_z(dt) -> str:
@@ -23,7 +28,7 @@ def _fmt_ts_z(dt) -> str:
 
 async def _send_signal_to_channel(bot: Bot, app: AppState, decision: SignalDecision, chart_path: str, df_sig) -> None:
     s = app.cfg.signal
-    direction = "🟢 BUY" if decision.action == "BUY" else "🔴 SELL"
+    direction = decision.telegram_signal_line() if hasattr(decision, "telegram_signal_line") else ("🟢 BUY" if decision.action == "BUY" else "🔴 SELL")
 
     last = df_sig.iloc[-1] if df_sig is not None and len(df_sig) > 0 else None
 
@@ -46,9 +51,38 @@ async def _send_signal_to_channel(bot: Bot, app: AppState, decision: SignalDecis
         html.escape(f"EMA{s.ema_fast}={ema_f:.2f} | EMA{s.ema_slow}={ema_sl:.2f}") if ... else html.escape("EMA=n/a"),
         html.escape(f"BB({s.bb_period},{s.bb_std}): L={bb_l:.2f} M={bb_m:.2f} U={bb_u:.2f}") if ... else html.escape(
             "BB=n/a"),
-        "",
-        f"<i>{html.escape(decision.reason)}</i>",
     ]
+
+    sig_type = getattr(getattr(decision, "signal_type", None), "value", None)
+    sig_mode = getattr(getattr(decision, "mode", None), "value", None)
+    if sig_type:
+        lines.append(html.escape(f"SignalType={sig_type} | Mode={sig_mode or '-'} | Strong={getattr(decision, 'strong_move', False)}"))
+
+    ml = getattr(decision, "ml", None)
+    if ml is not None and getattr(ml, "enabled", False):
+        lines.append(
+            html.escape(
+                "ML outcome: "
+                f"loaded={getattr(ml, 'model_loaded', False)} | "
+                f"long05={getattr(ml, 'long_05atr', 0.0):.2f} long10={getattr(ml, 'long_10atr', 0.0):.2f} | "
+                f"short05={getattr(ml, 'short_05atr', 0.0):.2f} short10={getattr(ml, 'short_10atr', 0.0):.2f} | "
+                f"long_ok={getattr(ml, 'long_ok', False)} short_ok={getattr(ml, 'short_ok', False)}"
+            )
+        )
+
+    lines.extend(["", f"<i>{html.escape(decision.reason)}</i>"])
+
+    try:
+        opt = process_options_signal(decision, tradernet_client=app.tn)
+        if opt.action != "NO_ACTION":
+            lines.extend(["", "<pre>" + html.escape(opt.telegram_block()) + "</pre>"])
+        else:
+            # Keep blocked 0DTE/position-state reasons visible when it matters.
+            if "0DTE" in (opt.reason or "") or "CLOSE_" in (getattr(getattr(decision, "signal_type", None), "value", "")):
+                lines.extend(["", "<pre>" + html.escape(opt.telegram_block()) + "</pre>"])
+    except Exception as e:
+        app.stats.last_error = f"options_signal: {repr(e)}"
+        lines.extend(["", "<pre>" + html.escape(f"QQQ options block\nOptions error: {repr(e)}") + "</pre>"])
 
     caption = "\n".join(lines)
 
@@ -72,17 +106,22 @@ async def _amain() -> None:
     cache = BarCache(timeframe_minutes=cfg.timeframe_minutes, maxlen=max(cfg.chart_bars * 5, 2000))
     stats = Stats()
 
-    # restore persisted signal state (last signals/position)
-    try:
-        sp = state_file_path(cfg.cache_dir, cfg.symbol, cfg.timeframe_minutes)
-        stats.load_state(sp)
-    except Exception:
-        pass
 
     async with aiohttp.ClientSession() as session:
-        tn = TraderNetClient(api_url=cfg.tradernet_api_url, quotes_url=cfg.tradernet_quotes_url, session=session)
+        tn = TraderNetClient(
+            api_url=cfg.tradernet_api_url,
+            quotes_url=cfg.tradernet_quotes_url,
+            session=session,
+            sid=cfg.tradernet_sid,
+            timeout_seconds=cfg.tradernet_timeout_seconds,
+        )
         app = AppState(cfg=cfg, tn=tn, cache=cache, stats=stats)
         app.strategy_id = cfg.strategy_id
+        if MLOutcomeService is not None:
+            try:
+                app.ml_outcome = MLOutcomeService()
+            except Exception as e:
+                stats.last_error = f"MLOutcomeService init: {repr(e)}"
 
         dp["app"] = app
 

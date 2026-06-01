@@ -31,7 +31,7 @@ class BotState:
     strategy_id: int = 1
 
     # Strategy #2 runtime
-    s2_position: str = "FLAT"              # "FLAT" | "LONG"
+    s2_position: str = "FLAT"              # "FLAT" | "LONG" | "SHORT"
     s2_entry_price: float | None = None
     s2_entry_ts: str | None = None         # UTC ISO
     s2_atr_stop: float | None = None

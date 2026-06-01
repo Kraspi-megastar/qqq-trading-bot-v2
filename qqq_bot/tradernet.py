@@ -190,3 +190,32 @@ class TraderNetClient:
         ltp = safe_float(row.get("ltp"))
         # ltt у вас иногда без tz — поэтому тут не парсим, чтобы не вводить в заблуждение
         return Quote(symbol=symbol, ltp=ltp, ltt=None)
+
+    async def get_option_quote(self, ticker: str) -> dict:
+        """Return raw option quote fields from TraderNet securities/export.
+
+        TraderNet uses compact field names in securities/export. For bid/ask the
+        public documentation names bbp/bap as best bid/best ask; ltp is last
+        traded price. Greeks/IV are requested as best-effort because availability
+        depends on market/account/data entitlement and may be absent for US options.
+        """
+        fields = [
+            "ltp", "ltt",
+            "bbp", "bap", "bbs", "bas",
+            "vol", "vlt", "oi",
+            "iv", "delta", "gamma", "theta", "vega",
+        ]
+        params = {"params": ",".join(fields), "tickers": ticker}
+        headers = {"User-Agent": "qqq_trading_bot/1.0"}
+        cookies = {"SID": self.sid} if self.sid else None
+        async with self.session.get(self.quotes_url, params=params, timeout=10, headers=headers, cookies=cookies) as r:
+            r.raise_for_status()
+            txt = await r.text()
+            data = json.loads(txt)
+
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            return {"ticker": ticker, "raw": data}
+
+        row = dict(data[0])
+        row["ticker"] = ticker
+        return row

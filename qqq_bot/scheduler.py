@@ -12,13 +12,14 @@ from .models import Bar
 from .utils_time import utc_now, floor_time
 from .indicators import ema, rsi, bollinger, macd, vwap, atr, supertrend
 from .signals import compute_signal, SignalDecision
+from .signal_types import SignalType
 from .charting import plot_chart
 from .tradernet import TraderNetClient
 from .state_store import apply_state_if_same_session, build_state_from_app, save_state
 
 @dataclass
 class Strategy2Runtime:
-    position: str = "FLAT"       # "FLAT" | "LONG"
+    position: str = "FLAT"       # "FLAT" | "LONG" | "SHORT"
     entry_price: float | None = None
     atr_stop: float | None = None
     entry_ts: datetime | None = None
@@ -38,6 +39,7 @@ class AppState:
 
     strategy_id: int = 1
     strategy2: Strategy2Runtime = field(default_factory=Strategy2Runtime)
+    ml_outcome: object | None = None
 
     def set_strategy(self, strategy_id: int) -> None:
         sid = int(strategy_id)
@@ -162,7 +164,7 @@ def _min_bars_for_indicators(cfg: AppConfig) -> int:
     return need + 5
 
 
-def _record_signal(app: AppState, action: str, bar_ts_utc: datetime, price: float | None) -> None:
+def _record_signal(app: AppState, action: str, bar_ts_utc: datetime, price: float | None, signal_type: str | None = None, mode: str | None = None) -> None:
     """
     Храним сигналы текущей сессии:
       (action, ts, price)
@@ -183,15 +185,18 @@ def _record_signal(app: AppState, action: str, bar_ts_utc: datetime, price: floa
         # поддержка старого формата (action, ts)
         last_action = last[0] if isinstance(last, (tuple, list)) and len(last) >= 1 else None
         last_ts = last[1] if isinstance(last, (tuple, list)) and len(last) >= 2 else None
+        last_signal_type = last[3] if isinstance(last, (tuple, list)) and len(last) >= 4 else None
 
         # один и тот же бар/сигнал
-        if last_action == action and last_ts == bar_ts_utc:
+        if last_action == action and last_ts == bar_ts_utc and last_signal_type == signal_type:
             return
-        # подряд одинаковое действие не пишем
-        if last_action == action:
+        # подряд одинаковое семантическое действие не пишем; одинаковый legacy BUY/SELL
+        # может означать разные события, например CLOSE_LONG и OPEN_SHORT.
+        if last_action == action and last_signal_type == signal_type:
             return
 
-    hist.append((action, bar_ts_utc, p))
+    item = (action, bar_ts_utc, p, signal_type, mode) if signal_type or mode else (action, bar_ts_utc, p)
+    hist.append(item)
 
     # лимит на сессию
     max_keep = 200
@@ -201,6 +206,8 @@ def _record_signal(app: AppState, action: str, bar_ts_utc: datetime, price: floa
     app.stats.last_signal = action
     app.stats.last_signal_ts = bar_ts_utc
     app.stats.last_signal_price = p
+    app.stats.last_signal_type = signal_type
+    app.stats.last_signal_mode = mode
 
 
 
@@ -224,8 +231,12 @@ def _replay_signal_history_from_cache(app: AppState, max_signals: int = 200) -> 
     sid = _session_id(last_ts.to_pydatetime(), cfg.display_tz) if pd.notna(last_ts) else None
     setattr(app.stats, "session_id", sid)
 
+    # Rebuild STR#2 runtime from cache to avoid carrying stale in-memory state.
+    if app.strategy_id == 2:
+        app.strategy2 = Strategy2Runtime()
+
     hist: list[tuple[str, datetime]] = []
-    prev_action: str | None = None
+    prev_key: tuple[str, str | None] | None = None
 
     for i in range(min_bars, len(df) + 1):
         window = df.iloc[:i]
@@ -241,7 +252,9 @@ def _replay_signal_history_from_cache(app: AppState, max_signals: int = 200) -> 
             if _session_id(ts_bar_dt, cfg.display_tz) != sid:
                 continue
 
-        if prev_action == dec.action:
+        dec_signal_type = getattr(getattr(dec, "signal_type", None), "value", str(getattr(dec, "signal_type", "")))
+        key = (dec.action, dec_signal_type)
+        if prev_key == key:
             continue
 
         bar_price = None
@@ -250,9 +263,10 @@ def _replay_signal_history_from_cache(app: AppState, max_signals: int = 200) -> 
         except Exception:
             bar_price = None
 
-        hist.append((dec.action, ts_bar_dt, bar_price))
+        dec_mode = getattr(getattr(dec, "mode", None), "value", str(getattr(dec, "mode", "")))
+        hist.append((dec.action, ts_bar_dt, bar_price, dec_signal_type, dec_mode))
 
-        prev_action = dec.action
+        prev_key = key
 
     app.stats.signal_history = hist[-max_signals:]
     if app.stats.signal_history:
@@ -262,6 +276,8 @@ def _replay_signal_history_from_cache(app: AppState, max_signals: int = 200) -> 
         app.stats.last_signal = last[0] if len(last) >= 1 else None
         app.stats.last_signal_ts = last[1] if len(last) >= 2 else None
         app.stats.last_signal_price = last[2] if len(last) >= 3 else None
+        app.stats.last_signal_type = last[3] if len(last) >= 4 else None
+        app.stats.last_signal_mode = last[4] if len(last) >= 5 else None
 
 
 def _adjust_date_to_for_closed_session(date_to_utc: datetime) -> datetime:
@@ -443,7 +459,7 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
             df = _bars_to_df(bars_real)
             df = _add_indicators(df, cfg)
 
-            decision = SignalDecision("HOLD", "Нет данных для сигнала.", {})
+            decision = SignalDecision(signal_type=SignalType.HOLD, action="HOLD", reason="Нет данных для сигнала.", details={})
             df_sig = pd.DataFrame()
 
             # 3) compute signal on CLOSED bars (exclude forming bar when session open)
@@ -451,11 +467,19 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                 df_sig = df.iloc[:-1].copy() if session_open else df.copy()
                 df_sig = _add_indicators(df_sig, cfg)
                 if len(df_sig) > 0:
+                    ml_decision = None
+                    if int(app.strategy_id) == 2 and app.ml_outcome is not None:
+                        try:
+                            ml_decision = app.ml_outcome.predict(df_sig)
+                        except Exception as e:
+                            app.stats.last_error = f"ml_outcome.predict: {repr(e)}"
+                            ml_decision = None
                     decision = compute_signal(
                         df_sig,
                         cfg.signal,
                         strategy_id=app.strategy_id,
                         runtime_state=app.strategy2,
+                        ml_decision=ml_decision,
                     )
 
             # 4) build "regular" chart.png (for /chart etc.)
@@ -500,7 +524,14 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                     sig_ts = pd.to_datetime(sig_ts, utc=True, errors="coerce").to_pydatetime()
 
                 # record to history BEFORE plotting for signal-message
-                _record_signal(app, decision.action, sig_ts, sig_price)
+                _record_signal(
+                    app,
+                    decision.action,
+                    sig_ts,
+                    sig_price,
+                    getattr(getattr(decision, "signal_type", None), "value", None),
+                    getattr(getattr(decision, "mode", None), "value", None),
+                )
 
                 # dedup by exact action+ts
                 if app.last_signal_sent == decision.action and app.last_signal_sent_ts == sig_ts:

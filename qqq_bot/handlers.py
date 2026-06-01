@@ -123,11 +123,12 @@ def _help_text() -> str:
 
 
 def _position_from_history(app: AppState) -> str:
+    if app.strategy_id == 2:
+        return str(getattr(app.strategy2, "position", "FLAT") or "FLAT").upper()
+
     hist = getattr(app.stats, "signal_history", None) or []
     if not hist:
         last = getattr(app.stats, "last_signal", None)
-        if app.strategy_id == 2:
-            return "LONG" if last == "BUY" else "FLAT"
         if last == "BUY":
             return "LONG"
         if last == "SELL":
@@ -135,8 +136,6 @@ def _position_from_history(app: AppState) -> str:
         return "FLAT"
 
     action = hist[-1][0]
-    if app.strategy_id == 2:
-        return "LONG" if action == "BUY" else "FLAT"
     return "LONG" if action == "BUY" else "SHORT" if action == "SELL" else "FLAT"
 
 
@@ -280,12 +279,13 @@ async def cmd_status(message: Message, app: AppState) -> None:
     last_sig_ts = _fmt_ts_z(getattr(app.stats, "last_signal_ts", None)) if getattr(app.stats, "last_signal_ts", None) else "-"
     last_sig_price = getattr(app.stats, "last_signal_price", None)
     last_sig_price_txt = f"{last_sig_price:.2f}" if isinstance(last_sig_price, (int, float)) else "-"
+    last_sig_type = getattr(app.stats, "last_signal_type", None) or "-"
 
     decision_txt = "Нет данных."
     if len(df) >= min_bars and len(df) >= 2:
         df_sig = df.iloc[:-1].copy()
         df_sig = _add_indicators(df_sig, app)
-        dec = compute_signal(df_sig, s, strategy_id=app.strategy_id, runtime_state=None)
+        dec = compute_signal(df_sig, s, strategy_id=app.strategy_id, runtime_state=None, current_position=getattr(app.strategy2, "position", "FLAT"))
         decision_txt = dec.reason
     else:
         decision_txt = f"Недостаточно данных для индикаторов: нужно {min_bars}, есть {len(df)}."
@@ -302,7 +302,12 @@ async def cmd_status(message: Message, app: AppState) -> None:
         t = item[1]
         p = item[2] if len(item) >= 3 else None
         p_txt = f" @ {p:.2f}" if isinstance(p, (int, float)) else ""
-        return f"{a} @ {_fmt_ts_z(t)}{p_txt}"
+        sig_type = item[3] if len(item) >= 4 and item[3] else None
+        mode = item[4] if len(item) >= 5 and item[4] else None
+        label = f"{a}/{sig_type}" if sig_type else str(a)
+        if mode:
+            label += f"/{mode}"
+        return f"{label} @ {_fmt_ts_z(t)}{p_txt}"
 
     tail = hist[-5:] if len(hist) > 5 else hist
     sig_hist_txt = "Сигналы текущей сессии: -" if not tail else "Сигналы текущей сессии:\n- " + "\n- ".join(
@@ -323,7 +328,7 @@ async def cmd_status(message: Message, app: AppState) -> None:
         f"Последняя ошибка: {last_err}\n\n"
         f"Последняя цена: {price_txt}\n"
         f"Время последнего бара (UTC): {last_bar_ts}\n"
-        f"Последний сигнал: {last_sig} @ {last_sig_ts}\n"
+        f"Последний сигнал: {last_sig} / {last_sig_type} @ {last_sig_ts}\n"
         f"Цена открытия (по сигналу): {last_sig_price_txt}\n"
         f"Позиция: {pos_txt}\n"
         f"{sig_hist_txt}\n\n"
