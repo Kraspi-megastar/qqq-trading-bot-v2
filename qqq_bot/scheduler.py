@@ -211,73 +211,127 @@ def _record_signal(app: AppState, action: str, bar_ts_utc: datetime, price: floa
 
 
 
-def _replay_signal_history_from_cache(app: AppState, max_signals: int = 200) -> None:
+def _replay_signal_history_from_cache(
+    app: AppState,
+    max_signals: int = 200,
+    max_replay_bars: int = 400,
+) -> None:
     """
-    Пересчитываем сигналы по истории и оставляем ТОЛЬКО текущую (по дате NY) сессию,
-    чтобы после рестарта внутри дня на графике были “все предыдущие сигналы”.
+    Rebuild lightweight signal_history for /status and /chart after restart.
+
+    Important:
+    - replay is diagnostic only;
+    - it must NOT send Telegram messages;
+    - it must NOT open/close option state;
+    - it must NOT process the full cache with O(n^2) cost.
+
+    We cap replay to the latest max_replay_bars bars. This is enough to restore
+    recent session triangles without blocking Telegram polling on small VPS.
     """
     cfg = app.cfg
+
     bars_real = [b for b in app.cache.to_list() if not getattr(b, "synthetic", False)]
-    df = _bars_to_df(bars_real)
+    if not bars_real:
+        app.stats.signal_history = []
+        app.stats.last_signal = None
+        app.stats.last_signal_ts = None
+        app.stats.last_signal_price = None
+        app.stats.last_signal_type = None
+        app.stats.last_signal_mode = None
+        return
+
+    # Limit replay workload. Keep enough warmup for indicators + recent session.
+    min_bars = _min_bars_for_indicators(cfg)
+    replay_len = max(min(len(bars_real), int(max_replay_bars)), min_bars + 50)
+    bars_replay = bars_real[-replay_len:]
+
+    df = _bars_to_df(bars_replay)
     if df.empty:
         app.stats.signal_history = []
+        app.stats.last_signal = None
+        app.stats.last_signal_ts = None
+        app.stats.last_signal_price = None
+        app.stats.last_signal_type = None
+        app.stats.last_signal_mode = None
         return
 
     df = _add_indicators(df, cfg)
-    min_bars = _min_bars_for_indicators(cfg)
 
-    # определим “текущую сессию” по последнему бару кеша
     last_ts = pd.to_datetime(df["ts"].iloc[-1], utc=True, errors="coerce")
     sid = _session_id(last_ts.to_pydatetime(), cfg.display_tz) if pd.notna(last_ts) else None
     setattr(app.stats, "session_id", sid)
 
-    # Rebuild STR#2 runtime from cache to avoid carrying stale in-memory state.
+    # Rebuild STR#2 runtime state only inside replay. This is diagnostic state
+    # restoration, not a trading action.
     if app.strategy_id == 2:
         app.strategy2 = Strategy2Runtime()
 
-    hist: list[tuple[str, datetime]] = []
+    hist: list[tuple] = []
     prev_key: tuple[str, str | None] | None = None
 
-    for i in range(min_bars, len(df) + 1):
+    start_i = min_bars
+    if len(df) <= start_i:
+        app.stats.signal_history = []
+        app.stats.last_signal = None
+        app.stats.last_signal_ts = None
+        app.stats.last_signal_price = None
+        app.stats.last_signal_type = None
+        app.stats.last_signal_mode = None
+        return
+
+    for i in range(start_i, len(df) + 1):
         window = df.iloc[:i]
-        dec = compute_signal(window, cfg.signal, strategy_id=app.strategy_id, runtime_state=app.strategy2)
+
+        dec = compute_signal(
+            window,
+            cfg.signal,
+            strategy_id=app.strategy_id,
+            runtime_state=app.strategy2,
+        )
+
         if dec.action not in ("BUY", "SELL"):
             continue
 
         ts_bar = window["ts"].iloc[-1]
-        ts_bar_dt = ts_bar if isinstance(ts_bar, datetime) else pd.to_datetime(ts_bar, utc=True, errors="coerce").to_pydatetime()
+        if isinstance(ts_bar, datetime):
+            ts_bar_dt = ts_bar
+        else:
+            ts_bar_dt = pd.to_datetime(ts_bar, utc=True, errors="coerce").to_pydatetime()
 
-        # фильтр по текущей сессии
-        if sid is not None:
-            if _session_id(ts_bar_dt, cfg.display_tz) != sid:
-                continue
+        # Keep only current NY-date session for status/chart.
+        if sid is not None and _session_id(ts_bar_dt, cfg.display_tz) != sid:
+            continue
 
         dec_signal_type = getattr(getattr(dec, "signal_type", None), "value", str(getattr(dec, "signal_type", "")))
+        dec_mode = getattr(getattr(dec, "mode", None), "value", str(getattr(dec, "mode", "")))
+
         key = (dec.action, dec_signal_type)
         if prev_key == key:
             continue
 
-        bar_price = None
         try:
             bar_price = float(window["close"].iloc[-1])
         except Exception:
             bar_price = None
 
-        dec_mode = getattr(getattr(dec, "mode", None), "value", str(getattr(dec, "mode", "")))
         hist.append((dec.action, ts_bar_dt, bar_price, dec_signal_type, dec_mode))
-
         prev_key = key
 
     app.stats.signal_history = hist[-max_signals:]
+
     if app.stats.signal_history:
         last = app.stats.signal_history[-1]
-
-        # поддержка форматов (action, ts) и (action, ts, price)
         app.stats.last_signal = last[0] if len(last) >= 1 else None
         app.stats.last_signal_ts = last[1] if len(last) >= 2 else None
         app.stats.last_signal_price = last[2] if len(last) >= 3 else None
         app.stats.last_signal_type = last[3] if len(last) >= 4 else None
         app.stats.last_signal_mode = last[4] if len(last) >= 5 else None
+    else:
+        app.stats.last_signal = None
+        app.stats.last_signal_ts = None
+        app.stats.last_signal_price = None
+        app.stats.last_signal_type = None
+        app.stats.last_signal_mode = None
 
 
 def _adjust_date_to_for_closed_session(date_to_utc: datetime) -> datetime:
@@ -419,7 +473,7 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                 app.state_loaded = True
                 if applied:
                     # лучше вынести в state_status, но пока оставим как есть
-                    app.stats.last_error = "State restored from state.json"
+                    app.stats.last_error = None
 
             _maybe_reset_session(app, now)
 
