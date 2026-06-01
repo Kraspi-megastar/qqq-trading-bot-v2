@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
@@ -12,14 +12,14 @@ from .models import Quote, Bar
 from .utils_time import safe_float, floor_time
 
 
-_TN_TZ = ZoneInfo("Europe/Moscow")  # сервер трактует строки DD.MM.YYYY HH:MM как MSK (по диагностике)
+_TN_TZ = ZoneInfo("Europe/Moscow")  # СЃРµСЂРІРµСЂ С‚СЂР°РєС‚СѓРµС‚ СЃС‚СЂРѕРєРё DD.MM.YYYY HH:MM РєР°Рє MSK (РїРѕ РґРёР°РіРЅРѕСЃС‚РёРєРµ)
 
 
 def _dt_to_tn_str(dt_utc: datetime) -> str:
     """
-    TraderNet getHloc ожидает строку 'DD.MM.YYYY HH:MM' без TZ.
-    Практически сервер интерпретирует её как MSK (UTC+3),
-    поэтому конвертируем из UTC -> MSK и форматируем.
+    TraderNet getHloc РѕР¶РёРґР°РµС‚ СЃС‚СЂРѕРєСѓ 'DD.MM.YYYY HH:MM' Р±РµР· TZ.
+    РџСЂР°РєС‚РёС‡РµСЃРєРё СЃРµСЂРІРµСЂ РёРЅС‚РµСЂРїСЂРµС‚РёСЂСѓРµС‚ РµС‘ РєР°Рє MSK (UTC+3),
+    РїРѕСЌС‚РѕРјСѓ РєРѕРЅРІРµСЂС‚РёСЂСѓРµРј РёР· UTC -> MSK Рё С„РѕСЂРјР°С‚РёСЂСѓРµРј.
     """
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
@@ -48,9 +48,9 @@ class TraderNetClient:
 
     async def get_quote_ltp(self, symbol: str) -> float:
         """
-        Реалтайм: берем последнюю цену (ltp) через securities/export.
+        Р РµР°Р»С‚Р°Р№Рј: Р±РµСЂРµРј РїРѕСЃР»РµРґРЅСЋСЋ С†РµРЅСѓ (ltp) С‡РµСЂРµР· securities/export.
         """
-        params = {"params": "ltp", "tickers": symbol}
+        params = {"fields": "ltp", "tickers": symbol}
         async with self.session.get(self.quotes_url, params=params, timeout=10) as r:
             r.raise_for_status()
             txt = await r.text()
@@ -71,10 +71,10 @@ class TraderNetClient:
         user_id: int | None = None,
     ) -> list[Bar]:
         """
-        История getHloc (candlesticks).
-        В документации TraderNet методы часто требуют SID (авторизация) —
-        поддерживаем его в payload и как Cookie, если задан. (SID может передаваться
-        cookie-значением SID либо параметром запроса.)
+        РСЃС‚РѕСЂРёСЏ getHloc (candlesticks).
+        Р’ РґРѕРєСѓРјРµРЅС‚Р°С†РёРё TraderNet РјРµС‚РѕРґС‹ С‡Р°СЃС‚Рѕ С‚СЂРµР±СѓСЋС‚ SID (Р°РІС‚РѕСЂРёР·Р°С†РёСЏ) вЂ”
+        РїРѕРґРґРµСЂР¶РёРІР°РµРј РµРіРѕ РІ payload Рё РєР°Рє Cookie, РµСЃР»Рё Р·Р°РґР°РЅ. (SID РјРѕР¶РµС‚ РїРµСЂРµРґР°РІР°С‚СЊСЃСЏ
+        cookie-Р·РЅР°С‡РµРЅРёРµРј SID Р»РёР±Рѕ РїР°СЂР°РјРµС‚СЂРѕРј Р·Р°РїСЂРѕСЃР°.)
         """
         payload = {
             "cmd": "getHloc",
@@ -91,7 +91,7 @@ class TraderNetClient:
         if self.sid:
             payload["SID"] = self.sid
 
-        # URL rotation: сначала основной, затем альтернативы (на случай блокировок/миграций домена).
+        # URL rotation: СЃРЅР°С‡Р°Р»Р° РѕСЃРЅРѕРІРЅРѕР№, Р·Р°С‚РµРј Р°Р»СЊС‚РµСЂРЅР°С‚РёРІС‹ (РЅР° СЃР»СѓС‡Р°Р№ Р±Р»РѕРєРёСЂРѕРІРѕРє/РјРёРіСЂР°С†РёР№ РґРѕРјРµРЅР°).
         urls = [self.api_url] + [u for u in self.alt_api_urls if u != self.api_url]
 
         last_exc: Exception | None = None
@@ -103,7 +103,7 @@ class TraderNetClient:
             cookies = {"SID": self.sid}
 
         for url in urls:
-            # 2 попытки на URL (часто помогает при сетевой нестабильности)
+            # 2 РїРѕРїС‹С‚РєРё РЅР° URL (С‡Р°СЃС‚Рѕ РїРѕРјРѕРіР°РµС‚ РїСЂРё СЃРµС‚РµРІРѕР№ РЅРµСЃС‚Р°Р±РёР»СЊРЅРѕСЃС‚Рё)
             for attempt in (1, 2):
                 try:
                     async with self.session.post(
@@ -159,7 +159,7 @@ class TraderNetClient:
 
                 except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as e:  # type: ignore[name-defined]
                     last_exc = e
-                    # короткий backoff
+                    # РєРѕСЂРѕС‚РєРёР№ backoff
                     if attempt == 1:
                         await asyncio.sleep(0.4)
                     continue
@@ -173,11 +173,11 @@ class TraderNetClient:
 
     async def get_quote(self, symbol: str) -> Quote:
         """
-        Расширенный quote через securities/export:
-        ltp — last traded price
-        ltt — last traded time (может приходить без TZ)
+        Р Р°СЃС€РёСЂРµРЅРЅС‹Р№ quote С‡РµСЂРµР· securities/export:
+        ltp вЂ” last traded price
+        ltt вЂ” last traded time (РјРѕР¶РµС‚ РїСЂРёС…РѕРґРёС‚СЊ Р±РµР· TZ)
         """
-        params = {"params": "ltp,ltt", "tickers": symbol}
+        params = {"fields": "ltp,ltt", "tickers": symbol}
         async with self.session.get(self.quotes_url, params=params, timeout=10) as r:
             r.raise_for_status()
             txt = await r.text()
@@ -188,7 +188,7 @@ class TraderNetClient:
 
         row = data[0] if isinstance(data[0], dict) else {}
         ltp = safe_float(row.get("ltp"))
-        # ltt у вас иногда без tz — поэтому тут не парсим, чтобы не вводить в заблуждение
+        # ltt Сѓ РІР°СЃ РёРЅРѕРіРґР° Р±РµР· tz вЂ” РїРѕСЌС‚РѕРјСѓ С‚СѓС‚ РЅРµ РїР°СЂСЃРёРј, С‡С‚РѕР±С‹ РЅРµ РІРІРѕРґРёС‚СЊ РІ Р·Р°Р±Р»СѓР¶РґРµРЅРёРµ
         return Quote(symbol=symbol, ltp=ltp, ltt=None)
 
     async def get_option_quote(self, ticker: str) -> dict:
@@ -205,7 +205,7 @@ class TraderNetClient:
             "vol", "vlt", "oi",
             "iv", "delta", "gamma", "theta", "vega",
         ]
-        params = {"params": ",".join(fields), "tickers": ticker}
+        params = {"fields": ",".join(fields), "tickers": ticker}
         headers = {"User-Agent": "qqq_trading_bot/1.0"}
         cookies = {"SID": self.sid} if self.sid else None
         async with self.session.get(self.quotes_url, params=params, timeout=10, headers=headers, cookies=cookies) as r:
@@ -219,3 +219,4 @@ class TraderNetClient:
         row = dict(data[0])
         row["ticker"] = ticker
         return row
+

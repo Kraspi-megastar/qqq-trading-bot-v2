@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -143,7 +143,7 @@ class DefaultOptionQuoteProvider:
             "iv", "delta", "gamma", "theta", "vega",
         ]
         sep = "&" if "?" in quotes_url else "?"
-        url = f"{quotes_url}{sep}{urllib.parse.urlencode({'params': ','.join(fields), 'tickers': ticker})}"
+        url = f"{quotes_url}{sep}{urllib.parse.urlencode({'fields': ','.join(fields), 'tickers': ticker})}"
         headers = {"User-Agent": "qqq_trading_bot/1.0"}
         sid = getattr(self.client, "sid", None)
         if sid:
@@ -218,3 +218,4 @@ class DefaultOptionQuoteProvider:
         except Exception:
             return None
         return None
+
