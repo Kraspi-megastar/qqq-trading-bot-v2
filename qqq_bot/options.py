@@ -134,36 +134,45 @@ def _moneyness(option_type: str, strike: float, price: float, step: float) -> st
 def _resolve_action(
     signal: str,                        # "BUY" | "SELL"
     position: Optional[OptionPosition], # текущая открытая позиция
+    can_short: bool = True,             # False для стратегий без шорта (напр. стратегия #2)
 ) -> tuple[OptionActionType, str]:      # (action_type, option_type)
     """
     Определяет что нужно сделать с опционом.
 
-    Возвращает (action_type, option_type):
-      ("OPEN",  "CALL") — открыть CALL
-      ("OPEN",  "PUT")  — открыть PUT
-      ("CLOSE", "CALL") — закрыть CALL (продать)
-      ("CLOSE", "PUT")  — закрыть PUT  (продать)
-      ("HOLD",  "CALL") — уже в CALL, ничего не делать
-      ("HOLD",  "PUT")  — уже в PUT,  ничего не делать
+    can_short=True  (стратегия #1, двунаправленная):
+      BUY  при FLAT → OPEN CALL
+      SELL при FLAT → OPEN PUT
+      SELL при CALL → CLOSE CALL
+      BUY  при PUT  → CLOSE PUT
+      BUY  при CALL → HOLD CALL
+      SELL при PUT  → HOLD PUT
+
+    can_short=False (стратегия #2, только лонг):
+      BUY  при FLAT → OPEN CALL
+      SELL при FLAT → HOLD (нет позиции для закрытия, шорт не открываем)
+      SELL при CALL → CLOSE CALL
+      BUY  при CALL → HOLD CALL
     """
     if position is None:
-        # FLAT — открываем новую позицию
-        return "OPEN", ("CALL" if signal == "BUY" else "PUT")
+        if signal == "BUY":
+            return "OPEN", "CALL"
+        else:  # SELL
+            if can_short:
+                return "OPEN", "PUT"
+            else:
+                # Стратегия без шорта: SELL при FLAT — просто нет позиции
+                return "HOLD", "CALL"  # тип не важен, action=HOLD
 
     if position.option_type == "CALL":
         if signal == "SELL":
-            # Сигнал противоположный — закрываем CALL
             return "CLOSE", "CALL"
         else:
-            # BUY при открытом CALL — уже в позиции
             return "HOLD", "CALL"
 
-    else:  # position.option_type == "PUT"
+    else:  # position.option_type == "PUT" (только стратегия #1)
         if signal == "BUY":
-            # Сигнал противоположный — закрываем PUT
             return "CLOSE", "PUT"
         else:
-            # SELL при открытом PUT — уже в позиции
             return "HOLD", "PUT"
 
 
@@ -242,6 +251,7 @@ async def get_option_recommendation(
     underlying_price: float,
     cfg: OptionConfig,
     current_position: Optional[OptionPosition],     # текущая открытая позиция
+    can_short: bool = True,                         # False для стратегии #2 (только лонг)
     session: Optional[aiohttp.ClientSession] = None,
     api_url: str = "https://tradernet.ru/api/",
     sid: Optional[str] = None,
@@ -250,10 +260,12 @@ async def get_option_recommendation(
     Возвращает рекомендацию с учётом текущей позиции.
 
     CLOSE означает закрытие существующей позиции.
-    OPEN  означает открытие новой позиции.
-    HOLD  означает что сигнал совпадает с текущей позицией — ничего не делать.
+    OPEN  означает открытие новой позиции (CALL или PUT в зависимости от can_short).
+    HOLD  означает что действие не требуется.
+
+    can_short=False (стратегия #2): SELL при FLAT → HOLD, PUT никогда не открывается.
     """
-    action_type, option_type = _resolve_action(signal, current_position)
+    action_type, option_type = _resolve_action(signal, current_position, can_short)
 
     today = datetime.now(tz=timezone.utc).date()
 
@@ -277,22 +289,40 @@ async def get_option_recommendation(
             new_position=None,   # после закрытия — FLAT
         )
 
-    # При HOLD — возвращаем текущую позицию без изменений
-    if action_type == "HOLD" and current_position is not None:
-        dte = _dte(current_position.expiry, today)
-        moneyness = _moneyness(option_type, current_position.strike, underlying_price, cfg.strike_step)
-        return OptionRecommendation(
-            action_type="HOLD",
-            option_type=option_type,
-            ticker=current_position.ticker,
-            strike=current_position.strike,
-            expiry=current_position.expiry,
-            dte=dte,
-            underlying_price=underlying_price,
-            moneyness=moneyness,
-            source="position",
-            new_position=current_position,  # позиция не меняется
-        )
+    # При HOLD — два случая:
+    #   1. Есть открытая позиция → возвращаем её без изменений
+    #   2. Нет позиции (SELL при FLAT, can_short=False) → возвращаем-заглушку без действия
+    if action_type == "HOLD":
+        if current_position is not None:
+            dte = _dte(current_position.expiry, today)
+            moneyness = _moneyness(option_type, current_position.strike, underlying_price, cfg.strike_step)
+            return OptionRecommendation(
+                action_type="HOLD",
+                option_type=option_type,
+                ticker=current_position.ticker,
+                strike=current_position.strike,
+                expiry=current_position.expiry,
+                dte=dte,
+                underlying_price=underlying_price,
+                moneyness=moneyness,
+                source="position",
+                new_position=current_position,  # позиция не меняется
+            )
+        else:
+            # SELL при FLAT для стратегии без шорта — ничего не делать
+            expiry_stub = _next_expiry(today, cfg.min_dte)
+            return OptionRecommendation(
+                action_type="HOLD",
+                option_type="CALL",          # тип не важен, action=HOLD
+                ticker="-",
+                strike=0.0,
+                expiry=expiry_stub,
+                dte=_dte(expiry_stub, today),
+                underlying_price=underlying_price,
+                moneyness="-",
+                source="none",
+                new_position=None,           # позиция остаётся FLAT
+            )
 
     # OPEN — рассчитываем новый контракт
     expiry = _next_expiry(today, cfg.min_dte)
@@ -352,7 +382,10 @@ def format_option_message(rec: OptionRecommendation) -> str:
         header = f"{emoji} <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
     else:  # HOLD
         emoji = "⏸"
-        header = f"{emoji} <b>Опцион: ДЕРЖАТЬ {rec.option_type}</b> (уже в позиции)"
+        if rec.new_position is not None:
+            header = f"{emoji} <b>Опцион: ДЕРЖАТЬ {rec.option_type}</b> (уже в позиции)"
+        else:
+            header = f"{emoji} <b>Опцион: нет действия</b> (позиция не открыта, шорт не используется)"
 
     lines = [
         header,

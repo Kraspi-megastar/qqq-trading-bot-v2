@@ -93,8 +93,8 @@ async def _send_signal_to_channel(
 
     lines += ["", f"<i>{html.escape(decision.reason)}</i>"]
 
-    # ── Опционный блок (только стратегия #1) ──────────────────────────────
-    if app.strategy_id == 1 and app.cfg.option.enabled and isinstance(close, float):
+    # ── Опционный блок (стратегии #1 и #2) ───────────────────────────────
+    if app.cfg.option.enabled and isinstance(close, float):
         try:
             oc = app.cfg.option
             opt_cfg = _OC(
@@ -104,11 +104,15 @@ async def _send_signal_to_channel(
                 strike_offset=oc.strike_offset,
                 underlying_symbol=oc.underlying_symbol,
             )
+            # Обе стратегии двунаправленные: BUY→CALL, SELL→PUT.
+            can_short = True
+
             rec = await get_option_recommendation(
                 signal=decision.action,
                 underlying_price=close,
                 cfg=opt_cfg,
                 current_position=app.option_position,
+                can_short=can_short,
                 session=session,
                 api_url=app.cfg.tradernet_api_url,
                 sid=app.cfg.tradernet_sid,
@@ -117,7 +121,9 @@ async def _send_signal_to_channel(
             # Применяем новую позицию
             app.option_position = rec.new_position
 
-            lines += ["", format_option_message(rec)]
+            # При HOLD без позиции (SELL при FLAT для стр.#2) — не показываем блок
+            if not (rec.action_type == "HOLD" and rec.new_position is None):
+                lines += ["", format_option_message(rec)]
         except Exception as e:
             lines += ["", html.escape(f"[Опцион: ошибка — {e}]")]
 

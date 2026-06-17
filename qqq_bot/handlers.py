@@ -65,7 +65,7 @@ def _help_text() -> str:
         "/stats — краткая статистика\n"
         "/chart — текущий график\n"
         "/last — последняя цена и последний бар\n"
-        "/options — текущий опционный контракт (стр. #1)\n"
+        "/options — текущая опционная позиция (стр. #1 и #2)\n"
         "/dump [N] — последние N баров\n"
         "/config — текущие настройки\n"
         "/strategy — показать текущую стратегию\n"
@@ -188,12 +188,7 @@ async def cmd_config(message: Message, app: AppState) -> None:
 @router.message(Command("options"))
 async def cmd_options(message: Message, app: AppState) -> None:
     """Показывает текущую опционную позицию и что будет при следующем сигнале."""
-    if app.strategy_id != 1:
-        await message.answer(
-            "Опционные сигналы доступны только для стратегии #1.\n"
-            "Переключитесь командой /strategy#1"
-        )
-        return
+    # Опционы работают для стратегии #1 (CALL + PUT) и #2 (только CALL, без шорта)
 
     if not app.cfg.option.enabled:
         await message.answer("Опционные сигналы отключены (OPTION_SIGNALS_ENABLED=0).")
@@ -228,11 +223,13 @@ async def cmd_options(message: Message, app: AppState) -> None:
         )
         for sig in ("BUY", "SELL"):
             try:
+                can_short = True
                 rec = await get_option_recommendation(
                     signal=sig,
                     underlying_price=last_price,
                     cfg=opt_cfg,
                     current_position=pos,
+                    can_short=can_short,
                     session=app.tn.session,
                     api_url=app.cfg.tradernet_api_url,
                     sid=app.cfg.tradernet_sid,
