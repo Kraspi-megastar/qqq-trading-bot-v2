@@ -29,6 +29,7 @@ from .models import Bar
 from .pipeline import bars_to_df, add_indicators, min_bars_for_indicators
 from .signals import compute_signal, SignalDecision, Strategy2State
 from .options import OptionPosition
+from .trades import TradeJournal
 from .charting import plot_chart
 from .tradernet import TraderNetClient
 from .state_store import apply_state_if_same_session, build_state_from_app, save_state
@@ -55,6 +56,7 @@ class AppState:
     strategy_id: int = 1
     strategy2: Strategy2State = field(default_factory=Strategy2State)
     option_position: OptionPosition | None = None  # стратегия #1: открытая опционная позиция
+    trade_journal: TradeJournal | None = None       # журнал опционных сделок
 
     def set_strategy(self, strategy_id: int) -> None:
         sid = int(strategy_id)
@@ -96,6 +98,7 @@ def _maybe_reset_session(app: AppState, now_utc: datetime) -> None:
         app.last_signal_sent_ts = None
         app.strategy2 = Strategy2State()
         app.option_position = None
+        # trade_journal не сбрасываем — история хранится между сессиями
 
 
 def _is_extended_session_open(now_utc: datetime, tz_name: str) -> bool:

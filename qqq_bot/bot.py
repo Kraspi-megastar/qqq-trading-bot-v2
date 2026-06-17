@@ -1,17 +1,16 @@
 """
-bot.py — точка входа: создаёт бота, запускает polling_loop и обработчики.
+bot.py — точка входа.
 
-Ключевая логика опционных сигналов (стратегия #1):
-  - Хранится app.option_position (OptionPosition | None).
-  - get_option_recommendation() получает текущую позицию и возвращает
-    рекомендацию с action_type: OPEN / CLOSE / HOLD.
-  - После отправки сигнала app.option_position обновляется через rec.new_position.
-  - Состояние персистируется в state.json.
+Опционные сделки:
+  - При OPEN: запрашиваем цену опциона через TraderNet, открываем TradeRecord.
+  - При CLOSE: запрашиваем цену, закрываем TradeRecord, считаем P&L.
+  - При HOLD: ничего не делаем с журналом.
 """
 from __future__ import annotations
 
 import asyncio
 import html
+from datetime import datetime, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher
@@ -25,15 +24,21 @@ from .tradernet import TraderNetClient
 from .scheduler import AppState, bootstrap_history, polling_loop
 from .handlers import router
 from .signals import SignalDecision
-from .options import (
-    get_option_recommendation,
-    format_option_message,
-    OptionConfig as _OC,
-)
+from .options import get_option_recommendation, format_option_message, OptionConfig as _OC
+from .trades import TradeJournal
 
 
 def _fmt_ts_z(dt) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt is not None else "-"
+
+
+async def _fetch_option_price(tn: TraderNetClient, tn_ticker: str) -> float | None:
+    """Запрашивает рыночную цену опциона из TraderNet. None при ошибке."""
+    try:
+        price = await asyncio.wait_for(tn.get_quote_ltp(tn_ticker), timeout=8.0)
+        return float(price) if price else None
+    except Exception:
+        return None
 
 
 async def _send_signal_to_channel(
@@ -85,7 +90,6 @@ async def _send_signal_to_channel(
         ),
     ]
 
-    # ATR-стоп для стратегии #2
     if app.strategy_id == 2:
         atr_stop = app.strategy2.atr_stop
         if atr_stop is not None:
@@ -93,7 +97,7 @@ async def _send_signal_to_channel(
 
     lines += ["", f"<i>{html.escape(decision.reason)}</i>"]
 
-    # ── Опционный блок (стратегии #1 и #2) ───────────────────────────────
+    # ── Опционный блок ────────────────────────────────────────────────────
     if app.cfg.option.enabled and isinstance(close, float):
         try:
             oc = app.cfg.option
@@ -104,26 +108,54 @@ async def _send_signal_to_channel(
                 strike_offset=oc.strike_offset,
                 underlying_symbol=oc.underlying_symbol,
             )
-            # Обе стратегии двунаправленные: BUY→CALL, SELL→PUT.
-            can_short = True
-
             rec = await get_option_recommendation(
                 signal=decision.action,
                 underlying_price=close,
                 cfg=opt_cfg,
                 current_position=app.option_position,
-                can_short=can_short,
+                can_short=True,
                 session=session,
                 api_url=app.cfg.tradernet_api_url,
                 sid=app.cfg.tradernet_sid,
             )
 
+            now_utc = datetime.now(tz=timezone.utc)
+            session_date = getattr(app.stats, "session_id", None) or now_utc.date().isoformat()
+
+            # ── Запись сделки в журнал ─────────────────────────────────────
+            if app.trade_journal is not None:
+                if rec.action_type == "OPEN":
+                    opt_price = await _fetch_option_price(app.tn, rec.tn_ticker)
+                    app.trade_journal.open_trade(
+                        session_date=session_date,
+                        option_type=rec.option_type,
+                        ticker=rec.tn_ticker,
+                        strike=rec.strike,
+                        expiry=rec.expiry,
+                        dte_at_entry=rec.dte,
+                        entry_price=opt_price,
+                        entry_underlying=close,
+                        entry_ts=now_utc,
+                    )
+                elif rec.action_type == "CLOSE" and app.option_position is not None:
+                    opt_price = await _fetch_option_price(app.tn, rec.tn_ticker)
+                    closed = app.trade_journal.close_trade(
+                        ticker=rec.tn_ticker,
+                        exit_price=opt_price,
+                        exit_underlying=close,
+                        exit_ts=now_utc,
+                    )
+                    # Добавляем P&L в сообщение
+                    if closed is not None:
+                        pnl_str = closed.pnl_str()
+                        lines.append(html.escape(f"P&L сделки: {pnl_str}"))
+
             # Применяем новую позицию
             app.option_position = rec.new_position
 
-            # При HOLD без позиции (SELL при FLAT для стр.#2) — не показываем блок
             if not (rec.action_type == "HOLD" and rec.new_position is None):
                 lines += ["", format_option_message(rec)]
+
         except Exception as e:
             lines += ["", html.escape(f"[Опцион: ошибка — {e}]")]
 
@@ -163,6 +195,7 @@ async def _amain() -> None:
         )
         app = AppState(cfg=cfg, tn=tn, cache=cache, stats=stats)
         app.strategy_id = cfg.strategy_id
+        app.trade_journal = TradeJournal(cfg.cache_dir)
 
         dp["app"] = app
 

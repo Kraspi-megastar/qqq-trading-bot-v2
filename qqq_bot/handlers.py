@@ -65,7 +65,9 @@ def _help_text() -> str:
         "/stats — краткая статистика\n"
         "/chart — текущий график\n"
         "/last — последняя цена и последний бар\n"
-        "/options — текущая опционная позиция (стр. #1 и #2)\n"
+        "/options — текущая опционная позиция\n"
+        "/trades [N] — последние N закрытых сделок\n"
+        "/dayreport — итоги дня по опционам\n"
         "/dump [N] — последние N баров\n"
         "/config — текущие настройки\n"
         "/strategy — показать текущую стратегию\n"
@@ -357,6 +359,103 @@ async def cmd_stats(message: Message, app: AppState) -> None:
         f"Last error: {getattr(app.stats, 'last_error', None) or '-'}"
     )
     await message.answer("<pre>" + html.escape(txt) + "</pre>")
+
+
+@router.message(Command("trades"))
+async def cmd_trades(message: Message, app: AppState) -> None:
+    """Последние закрытые опционные сделки."""
+    if app.trade_journal is None:
+        await message.answer("Журнал сделок недоступен.")
+        return
+
+    parts = (message.text or "").split()
+    n = 10
+    if len(parts) >= 2:
+        try:
+            n = max(1, min(50, int(parts[1])))
+        except Exception:
+            pass
+
+    trades = app.trade_journal.closed_trades(limit=n)
+    open_t = app.trade_journal.any_open()
+
+    if not trades and open_t is None:
+        await message.answer("Закрытых сделок нет.")
+        return
+
+    lines = [f"Последние закрытые опционные сделки QQQ: {len(trades)}", ""]
+    for t in trades:
+        entry_dt = t.entry_ts_dt()
+        date_str = entry_dt.strftime("%Y-%m-%d") if entry_dt else "?"
+        entry_str = f"{t.entry_price:.4f}" if t.entry_price is not None else "None"
+        exit_str  = f"{t.exit_price:.4f}"  if t.exit_price  is not None else "None"
+        lines.append(
+            f"{date_str} | +{t.ticker} | {t.option_type} | exit | "
+            f"DTE={t.dte_at_entry} | entry={entry_str} exit={exit_str} | P/L={t.pnl_str()}"
+        )
+
+    if open_t is not None:
+        lines += ["", "Открытая позиция:"]
+        entry_str = f"{open_t.entry_price}" if open_t.entry_price is not None else "None"
+        spot_str  = f"{open_t.entry_underlying:.2f}"
+        lines.append(
+            f"+{open_t.ticker} | {open_t.option_type} | entry={entry_str} | "
+            f"spot={spot_str} | ts={open_t.entry_ts}"
+        )
+
+    await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
+
+
+@router.message(Command("dayreport"))
+async def cmd_dayreport(message: Message, app: AppState) -> None:
+    """Дневной отчёт по опционным сделкам."""
+    if app.trade_journal is None:
+        await message.answer("Журнал сделок недоступен.")
+        return
+
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(app.cfg.display_tz)
+    today_str = datetime.now(tz=tz).date().isoformat()
+
+    closed = app.trade_journal.closed_trades(session_date=today_str, limit=200)
+    open_t = app.trade_journal.any_open()
+
+    total = len(closed)
+    with_pnl = [t for t in closed if t.pnl() is not None]
+    wins  = [t for t in with_pnl if (t.pnl() or 0) > 0]
+    losses= [t for t in with_pnl if (t.pnl() or 0) <= 0]
+
+    total_pnl = sum(t.pnl() for t in with_pnl) if with_pnl else 0.0
+    avg_pnl   = total_pnl / len(with_pnl) if with_pnl else None
+    win_rate  = f"{len(wins)/len(with_pnl)*100:.0f}%" if with_pnl else "n/a"
+
+    lines = [
+        f"Дневной отчёт по опционам QQQ — {today_str}",
+        "",
+        f"Закрытых сделок: {total} (с P/L: {len(with_pnl)})",
+        f"Win/Loss: {len(wins)} / {len(losses)}",
+        f"Win rate: {win_rate}",
+        f"Итоговый P/L: ${total_pnl:.2f}",
+        f"Средний P/L: {'${:.2f}'.format(avg_pnl) if avg_pnl is not None else 'n/a'}",
+    ]
+
+    if open_t is not None:
+        entry_str = f"{open_t.entry_price}" if open_t.entry_price is not None else "None"
+        spot_str  = f"{open_t.entry_underlying:.2f}"
+        lines += [
+            "",
+            "Открытая позиция:",
+            f"  +{open_t.ticker} {open_t.option_type} "
+            f"entry={entry_str} spot={spot_str} ts={open_t.entry_ts}",
+        ]
+
+    if not closed and open_t is None:
+        lines.append("")
+        lines.append("Сделок за дату нет или они ещё не закрыты.")
+
+    await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
 
 
 @router.message(F.text.startswith("/strategy"))

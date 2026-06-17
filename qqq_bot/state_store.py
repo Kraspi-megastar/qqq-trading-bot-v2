@@ -67,6 +67,7 @@ class BotState:
     # Опционная позиция (стратегия #1)
     opt_type: Optional[str] = None        # "CALL" | "PUT" | None
     opt_ticker: Optional[str] = None
+    opt_tn_ticker: Optional[str] = None   # TraderNet format: QQQ.17JUN2026.C749
     opt_strike: Optional[float] = None
     opt_expiry: Optional[str] = None      # ISO date string
     opt_entry_underlying: Optional[float] = None
@@ -141,9 +142,16 @@ def apply_state_if_same_session(
 
     # Опционная позиция
     if st.opt_type and st.opt_ticker and st.opt_strike is not None and st.opt_expiry:
+        from .options import tradernet_option_ticker as _tn_fmt
+        tn_tick = st.opt_tn_ticker or _tn_fmt(
+            st.opt_type,
+            st.opt_strike or 0.0,
+            _parse_date_iso(st.opt_expiry) or date.today(),
+        )
         app.option_position = OptionPosition(
             option_type=st.opt_type,
             ticker=st.opt_ticker,
+            tn_ticker=tn_tick,
             strike=st.opt_strike,
             expiry=_parse_date_iso(st.opt_expiry) or date.today(),
             entry_underlying=st.opt_entry_underlying or 0.0,
@@ -167,6 +175,7 @@ def build_state_from_app(*, app: Any, session_id: str) -> BotState:
         # опционная позиция
         opt_type=pos.option_type if pos else None,
         opt_ticker=pos.ticker if pos else None,
+        opt_tn_ticker=pos.tn_ticker if pos else None,
         opt_strike=pos.strike if pos else None,
         opt_expiry=_date_iso(pos.expiry) if pos else None,
         opt_entry_underlying=pos.entry_underlying if pos else None,

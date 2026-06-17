@@ -43,7 +43,8 @@ OptionActionType = Literal["OPEN", "CLOSE", "HOLD"]
 class OptionPosition:
     """Открытая опционная позиция. None = позиция закрыта (FLAT)."""
     option_type: str          # "CALL" | "PUT"
-    ticker: str               # например "QQQ 250718C480"
+    ticker: str               # краткий тикер "QQQ 250718C480"
+    tn_ticker: str            # тикер TraderNet "QQQ.18JUL2025.C480" для котировок
     strike: float
     expiry: date
     entry_underlying: float   # цена QQQ на момент открытия
@@ -78,7 +79,8 @@ class OptionConfig:
 class OptionRecommendation:
     action_type: OptionActionType   # "OPEN" | "CLOSE" | "HOLD"
     option_type: str                # "CALL" | "PUT"
-    ticker: str
+    ticker: str                     # краткий тикер QQQ 260619C480
+    tn_ticker: str                  # тикер TraderNet QQQ.19JUN2026.C480 (для котировок)
     strike: float
     expiry: date
     dte: int
@@ -174,6 +176,17 @@ def _resolve_action(
             return "CLOSE", "PUT"
         else:
             return "HOLD", "PUT"
+
+
+def tradernet_option_ticker(option_type: str, strike: float, expiry: date) -> str:
+    """
+    Формат TraderNet для запроса цены опциона: QQQ.17JUN2026.C749
+    Используется в get_quote_ltp чтобы получить рыночную цену опциона.
+    """
+    ot = "C" if option_type == "CALL" else "P"
+    date_str = expiry.strftime("%d%b%Y").upper()   # 17JUN2026
+    strike_str = str(int(strike)) if strike == int(strike) else f"{strike:.2f}"
+    return f"QQQ.{date_str}.{ot}{strike_str}"
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -280,13 +293,14 @@ async def get_option_recommendation(
             action_type="CLOSE",
             option_type=option_type,
             ticker=ticker,
+            tn_ticker=current_position.tn_ticker,
             strike=strike,
             expiry=expiry,
             dte=dte,
             underlying_price=underlying_price,
             moneyness=moneyness,
-            source="position",   # берём из сохранённой позиции
-            new_position=None,   # после закрытия — FLAT
+            source="position",
+            new_position=None,
         )
 
     # При HOLD — два случая:
@@ -300,28 +314,30 @@ async def get_option_recommendation(
                 action_type="HOLD",
                 option_type=option_type,
                 ticker=current_position.ticker,
+                tn_ticker=current_position.tn_ticker,
                 strike=current_position.strike,
                 expiry=current_position.expiry,
                 dte=dte,
                 underlying_price=underlying_price,
                 moneyness=moneyness,
                 source="position",
-                new_position=current_position,  # позиция не меняется
+                new_position=current_position,
             )
         else:
             # SELL при FLAT для стратегии без шорта — ничего не делать
             expiry_stub = _next_expiry(today, cfg.min_dte)
             return OptionRecommendation(
                 action_type="HOLD",
-                option_type="CALL",          # тип не важен, action=HOLD
+                option_type="CALL",
                 ticker="-",
+                tn_ticker="-",
                 strike=0.0,
                 expiry=expiry_stub,
                 dte=_dte(expiry_stub, today),
                 underlying_price=underlying_price,
                 moneyness="-",
                 source="none",
-                new_position=None,           # позиция остаётся FLAT
+                new_position=None,
             )
 
     # OPEN — рассчитываем новый контракт
@@ -344,9 +360,12 @@ async def get_option_recommendation(
     source = "tradernet" if tn_ticker else "calculated"
     ticker = tn_ticker or _build_ticker(option_type, strike, expiry)
 
+    tn_tick = tradernet_option_ticker(option_type, strike, expiry)
+
     new_position = OptionPosition(
         option_type=option_type,
         ticker=ticker,
+        tn_ticker=tn_tick,
         strike=strike,
         expiry=expiry,
         entry_underlying=underlying_price,
@@ -357,6 +376,7 @@ async def get_option_recommendation(
         action_type="OPEN",
         option_type=option_type,
         ticker=ticker,
+        tn_ticker=tn_tick,
         strike=strike,
         expiry=expiry,
         dte=dte,
