@@ -177,11 +177,12 @@ async def cmd_config(message: Message, app: AppState) -> None:
         f"ATR:           period={s.atr_period} stop_mult={s.atr_stop_mult}",
         f"EMA trend:     {s.ema_trend_period}",
         "",
-        "── Опционы (стр.#1) ──",
+        "── Опционы (стр.#1 и #2) ──",
         f"Enabled:       {o.enabled}",
         f"Min DTE:       {o.min_dte}",
         f"Strike step:   {o.strike_step}",
-        f"Strike offset: {o.strike_offset} ({'ATM' if o.strike_offset == 0 else 'OTM'})",
+        f"Target delta:  {o.target_delta}",
+        f"Max exp tries: {o.max_expiry_tries}",
         f"Underlying:    {o.underlying_symbol}",
     ]
     await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
@@ -210,6 +211,7 @@ async def cmd_options(message: Message, app: AppState) -> None:
     else:
         pos_lines.append(f"Текущая позиция: {pos.option_type} OPEN")
         pos_lines.append(f"  Тикер:      {pos.ticker}")
+        pos_lines.append(f"  TraderNet:  {pos.tn_ticker}")
         pos_lines.append(f"  Страйк:     {pos.strike:.0f}")
         pos_lines.append(f"  Экспирация: {pos.expiry.strftime('%d %b %Y')}")
         pos_lines.append(f"  Открыт при: QQQ={pos.entry_underlying:.2f} ({pos.entry_date})")
@@ -220,25 +222,39 @@ async def cmd_options(message: Message, app: AppState) -> None:
         oc = app.cfg.option
         opt_cfg = _OC(
             enabled=oc.enabled, min_dte=oc.min_dte,
-            strike_step=oc.strike_step, strike_offset=oc.strike_offset,
+            strike_step=oc.strike_step,
             underlying_symbol=oc.underlying_symbol,
+            target_delta=oc.target_delta,
+            max_expiry_tries=oc.max_expiry_tries,
+            risk_free_rate=oc.risk_free_rate,
         )
+        # ATR из последнего бара (для оценки волатильности)
+        atr_v = None
+        try:
+            tail = app.cache.to_list()[-(app.cfg.atr_period_safe if hasattr(app.cfg, 'atr_period_safe') else 50):]
+            import pandas as pd
+            from .pipeline import bars_to_df, add_indicators
+            dfa = add_indicators(bars_to_df(tail), app.cfg)
+            if len(dfa) and "atr" in dfa.columns and pd.notna(dfa["atr"].iloc[-1]):
+                atr_v = float(dfa["atr"].iloc[-1])
+        except Exception:
+            atr_v = None
+
         for sig in ("BUY", "SELL"):
             try:
-                can_short = True
                 rec = await get_option_recommendation(
                     signal=sig,
                     underlying_price=last_price,
                     cfg=opt_cfg,
                     current_position=pos,
-                    can_short=can_short,
-                    session=app.tn.session,
-                    api_url=app.cfg.tradernet_api_url,
-                    sid=app.cfg.tradernet_sid,
+                    market_open=True,    # в /options показываем как было бы в RTH
+                    atr=atr_v,
+                    tn=app.tn,
                 )
                 arrow = "→"
+                d_str = f" Δ={rec.delta:.2f}" if rec.delta is not None else ""
                 next_lines.append(
-                    f"При {sig} {arrow} {rec.action_type} {rec.option_type} {rec.ticker}"
+                    f"При {sig} {arrow} {rec.action_type} {rec.option_type} {rec.ticker}{d_str}"
                 )
             except Exception as e:
                 next_lines.append(f"При {sig} → ошибка: {e}")

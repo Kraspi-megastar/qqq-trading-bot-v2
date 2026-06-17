@@ -18,22 +18,8 @@ from typing import Optional
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Формат тикера TraderNet
-# ────────────────────────────────────────────────────────────────────────────
-
-def tradernet_option_ticker(option_type: str, strike: float, expiry: date) -> str:
-    """
-    Формат TraderNet: QQQ.17JUN2026.C749
-    Используется для запроса цены опциона через get_quote_ltp.
-    """
-    ot = "C" if option_type == "CALL" else "P"
-    date_str = expiry.strftime("%d%b%Y").upper()          # 17JUN2026
-    strike_str = str(int(strike)) if strike == int(strike) else f"{strike:.2f}"
-    return f"QQQ.{date_str}.{ot}{strike_str}"
-
-
-# ────────────────────────────────────────────────────────────────────────────
 # Запись о сделке
+# (формат тикера TraderNet см. options.tradernet_option_ticker: +QQQ.31JUL2026.C732)
 # ────────────────────────────────────────────────────────────────────────────
 
 @dataclass

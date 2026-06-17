@@ -28,7 +28,7 @@ from .config import AppConfig
 from .models import Bar
 from .pipeline import bars_to_df, add_indicators, min_bars_for_indicators
 from .signals import compute_signal, SignalDecision, Strategy2State
-from .options import OptionPosition
+from .options import OptionPosition, OptionConfig, get_option_recommendation
 from .trades import TradeJournal
 from .charting import plot_chart
 from .tradernet import TraderNetClient
@@ -59,12 +59,33 @@ class AppState:
     trade_journal: TradeJournal | None = None       # журнал опционных сделок
 
     def set_strategy(self, strategy_id: int) -> None:
+        """
+        Переключение стратегии. Открытая опционная позиция ПЕРЕНОСИТСЯ
+        в новую стратегию (не сбрасывается) — продолжаем её вести.
+
+        Strategy2State синхронизируется с опционной позицией: если открыт CALL,
+        стратегия #2 считается LONG; если открыт PUT или FLAT — стратегия стартует FLAT
+        (стратегия #2 управляет своим выходом по своим правилам только для CALL/LONG).
+        """
         sid = int(strategy_id)
         if sid not in (1, 2):
             return
         self.strategy_id = sid
-        self.strategy2 = Strategy2State()
-        self.option_position = None
+
+        # Синхронизируем Strategy2State с текущей опционной позицией
+        if self.option_position is not None and self.option_position.option_type == "CALL":
+            self.strategy2 = Strategy2State(
+                position="LONG",
+                entry_price=self.option_position.entry_underlying,
+                atr_stop=None,
+                entry_ts=None,
+            )
+        else:
+            # PUT или FLAT — стратегия #2 не умеет вести PUT через свой state,
+            # но позиция сохраняется и управляется через _resolve_action по сигналам
+            self.strategy2 = Strategy2State()
+
+        # сбрасываем только дедупликацию отправки, позицию НЕ трогаем
         self.last_signal_sent = None
         self.last_signal_sent_ts = None
 
@@ -97,11 +118,14 @@ def _maybe_reset_session(app: AppState, now_utc: datetime) -> None:
         app.last_signal_sent = None
         app.last_signal_sent_ts = None
         app.strategy2 = Strategy2State()
-        app.option_position = None
-        # trade_journal не сбрасываем — история хранится между сессиями
+        # option_position НЕ сбрасываем при смене дня — позиция закрывается
+        # только сигналом SELL/BUY, а не молча по календарю.
+        # trade_journal тоже сохраняется между сессиями.
 
 
 def _is_extended_session_open(now_utc: datetime, tz_name: str) -> bool:
+    """Расширенная сессия (премаркет+RTH+афтермаркет): 4:00–20:00 ET.
+    Используется для сбора баров."""
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     tz = ZoneInfo(tz_name)
@@ -110,6 +134,18 @@ def _is_extended_session_open(now_utc: datetime, tz_name: str) -> bool:
         return False
     t = local.timetz().replace(tzinfo=None)
     return time(4, 0) <= t < time(20, 0)
+
+
+def _is_rth_open(now_utc: datetime, tz_name: str) -> bool:
+    """Основная сессия (Regular Trading Hours): 9:30–16:00 ET, будни.
+    Только в это время торгуются опционы."""
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    local = now_utc.astimezone(ZoneInfo(tz_name))
+    if local.weekday() >= 5:
+        return False
+    t = local.timetz().replace(tzinfo=None)
+    return time(9, 30) <= t < time(16, 0)
 
 
 def _apply_new_state(app: AppState, decision: SignalDecision) -> None:
@@ -378,6 +414,20 @@ async def bootstrap_history(app: AppState) -> None:
 # Главный цикл
 # ────────────────────────────────────────────────────────────────────────────
 
+def _option_cfg(cfg: AppConfig) -> OptionConfig:
+    """Конвертирует AppConfig.option в options.OptionConfig."""
+    o = cfg.option
+    return OptionConfig(
+        enabled=o.enabled,
+        min_dte=o.min_dte,
+        strike_step=o.strike_step,
+        underlying_symbol=o.underlying_symbol,
+        target_delta=getattr(o, "target_delta", 0.375),
+        max_expiry_tries=getattr(o, "max_expiry_tries", 4),
+        risk_free_rate=getattr(o, "risk_free_rate", 0.05),
+    )
+
+
 async def polling_loop(app: AppState, send_signal_cb) -> None:
     cfg = app.cfg
     tf = cfg.timeframe_minutes
@@ -504,11 +554,52 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                 if not isinstance(sig_ts, datetime):
                     sig_ts = pd.to_datetime(sig_ts, utc=True, errors="coerce").to_pydatetime()
 
+                # Определяем что произойдёт с опционом ДО отправки.
+                # Сообщение шлём только если позиция реально меняется (OPEN/CLOSE).
+                # HOLD (уже в позиции) и пропуск из-за закрытого рынка — НЕ шлём.
+                rec = None
+                if app.cfg.option.enabled:
+                    rth_open = _is_rth_open(now, cfg.display_tz)
+                    atr_v = None
+                    try:
+                        if len(df_sig) > 0 and "atr" in df_sig.columns:
+                            av = df_sig["atr"].iloc[-1]
+                            atr_v = float(av) if pd.notna(av) else None
+                    except Exception:
+                        atr_v = None
+                    try:
+                        rec = await get_option_recommendation(
+                            signal=decision.action,
+                            underlying_price=float(sig_price) if sig_price else float(df["close"].iloc[-1]),
+                            cfg=_option_cfg(cfg),
+                            current_position=app.option_position,
+                            market_open=rth_open,
+                            atr=atr_v,
+                            tn=app.tn,
+                        )
+                    except Exception as e:
+                        app.stats.last_error = f"option_rec: {repr(e)}"
+                        rec = None
+
+                # Решаем, нужно ли вообще отправлять сообщение
+                should_send = True
+                if rec is not None:
+                    if rec.action_type == "HOLD":
+                        # уже в позиции в ту же сторону, либо пропуск — не шлём
+                        should_send = False
+                    if rec.skipped_market_closed and rec.action_type != "CLOSE":
+                        should_send = False
+
                 _record_signal(app, decision.action, sig_ts, sig_price)
 
-                # Дедупликация: один и тот же action на том же баре
+                # Дедупликация: тот же action на том же баре
                 if app.last_signal_sent == decision.action and app.last_signal_sent_ts == sig_ts:
-                    pass
+                    should_send = False
+
+                if not should_send:
+                    # Фиксируем что обработали этот бар, но не шлём дубликат
+                    app.last_signal_sent = decision.action
+                    app.last_signal_sent_ts = sig_ts
                 else:
                     active, _left = _cooldown_active(app)
                     if active and app.last_signal_sent == decision.action:
@@ -544,7 +635,8 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             signal_chart_path = chart_path
 
                         try:
-                            await send_signal_cb(decision, str(signal_chart_path), df_sig)
+                            # Передаём готовую рекомендацию в callback
+                            await send_signal_cb(decision, str(signal_chart_path), df_sig, rec)
                             try:
                                 app.persist_state(now)
                             except Exception as e:

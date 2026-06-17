@@ -1,102 +1,101 @@
 """
-options.py — управление опционными позициями для стратегии #1.
+options.py — управление опционными позициями для стратегий #1 и #2.
 
-Логика позиций:
-  Состояние FLAT (нет открытой позиции):
-    BUY  → OPEN CALL
-    SELL → OPEN PUT
+Логика позиций (обе стратегии двунаправленные):
+  FLAT      + BUY  → OPEN CALL
+  FLAT      + SELL → OPEN PUT
+  CALL open + SELL → CLOSE CALL
+  PUT  open + BUY  → CLOSE PUT
+  CALL open + BUY  → HOLD CALL
+  PUT  open + SELL → HOLD PUT
 
-  Состояние LONG CALL (открыт CALL):
-    SELL → CLOSE CALL   ← разворот, не открываем PUT
-    BUY  → HOLD         ← уже в позиции, игнорируем
+Выбор страйка (для OPEN):
+  Цель — опцион с дельтой target_delta (по умолчанию 0.375, диапазон 0.35–0.40).
+  Источник дельты, по приоритету:
+    1. TraderNet опционная цепочка (если в ней есть поле delta)
+    2. Black-Scholes (волатильность оценивается из ATR)
+    3. Аппроксимация по расстоянию от ATM
 
-  Состояние LONG PUT (открыт PUT):
-    BUY  → CLOSE PUT    ← разворот, не открываем CALL
-    SELL → HOLD         ← уже в позиции, игнорируем
-
-После CLOSE позиция сбрасывается в FLAT.
-Следующий сигнал того же направления откроет новую позицию.
+Валидация существования:
+  Перед открытием проверяем что опцион реально торгуется (есть котировка в TraderNet).
+  Если ближайшая экспирация попадает на нерабочий день — опциона не будет,
+  пробуем следующую пятницу.
 """
 from __future__ import annotations
 
 import asyncio
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import aiohttp
 
+from .greeks import (
+    bs_delta,
+    strike_for_target_delta,
+    years_to_expiry,
+    estimate_sigma_from_atr,
+)
 
-# ────────────────────────────────────────────────────────────────────────────
-# Типы действий над опционом
-# ────────────────────────────────────────────────────────────────────────────
 
 OptionActionType = Literal["OPEN", "CLOSE", "HOLD"]
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Состояние текущей опционной позиции
+# Состояние позиции
 # ────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class OptionPosition:
-    """Открытая опционная позиция. None = позиция закрыта (FLAT)."""
     option_type: str          # "CALL" | "PUT"
     ticker: str               # краткий тикер "QQQ 250718C480"
-    tn_ticker: str            # тикер TraderNet "QQQ.18JUL2025.C480" для котировок
+    tn_ticker: str            # тикер TraderNet "QQQ.18JUL2025.C480"
     strike: float
     expiry: date
-    entry_underlying: float   # цена QQQ на момент открытия
-    entry_date: date          # дата открытия
+    entry_underlying: float
+    entry_date: date
 
-    def describe(self) -> str:
-        return (
-            f"{self.option_type} {self.ticker} "
-            f"страйк={self.strike:.0f} экспирация={self.expiry.strftime('%d %b %Y')} "
-            f"открыт по QQQ={self.entry_underlying:.2f}"
-        )
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Конфиг
-# ────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class OptionConfig:
     enabled: bool = True
     min_dte: int = 1
     strike_step: float = 1.0
-    strike_offset: int = 0        # 0=ATM, 1=1 шаг OTM, -1=1 шаг ITM
     underlying_symbol: str = "QQQ.US"
+    # Целевая дельта для выбора страйка
+    target_delta: float = 0.375
+    # Сколько будущих пятниц перебрать в поисках торгуемой экспирации
+    max_expiry_tries: int = 4
+    # Безрисковая ставка для Black-Scholes
+    risk_free_rate: float = 0.05
 
-
-# ────────────────────────────────────────────────────────────────────────────
-# Результат рекомендации
-# ────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class OptionRecommendation:
-    action_type: OptionActionType   # "OPEN" | "CLOSE" | "HOLD"
-    option_type: str                # "CALL" | "PUT"
-    ticker: str                     # краткий тикер QQQ 260619C480
-    tn_ticker: str                  # тикер TraderNet QQQ.19JUN2026.C480 (для котировок)
+    action_type: OptionActionType
+    option_type: str
+    ticker: str
+    tn_ticker: str
     strike: float
     expiry: date
     dte: int
     underlying_price: float
-    moneyness: str                  # "ATM" / "OTM" / "ITM"
-    source: str                     # "tradernet" / "calculated"
-    # позиция после применения этой рекомендации
+    delta: Optional[float]          # дельта выбранного страйка (если известна)
+    delta_source: str               # "tradernet" / "black-scholes" / "approx" / "-"
+    moneyness: str
+    source: str                     # источник тикера: "tradernet" / "calculated" / "position" / "none"
     new_position: Optional[OptionPosition]
+    # Флаг: действие не выполнено т.к. рынок опционов закрыт (премаркет/афтермаркет)
+    skipped_market_closed: bool = False
+    # Флаг: не нашли торгуемый опцион
+    skipped_no_contract: bool = False
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Вспомогательные функции
+# Тикеры и даты
 # ────────────────────────────────────────────────────────────────────────────
 
-def _next_expiry(from_date: date, min_dte: int) -> date:
-    """Ближайшая пятница >= from_date + min_dte."""
+def _next_friday(from_date: date, min_dte: int) -> date:
     target = from_date + timedelta(days=min_dte)
     days_to_friday = (4 - target.weekday()) % 7
     return target + timedelta(days=days_to_friday)
@@ -106,18 +105,21 @@ def _dte(expiry: date, today: date) -> int:
     return (expiry - today).days
 
 
-def _build_ticker(option_type: str, strike: float, expiry: date) -> str:
+def short_ticker(option_type: str, strike: float, expiry: date) -> str:
     ot = "C" if option_type == "CALL" else "P"
     strike_str = str(int(strike)) if strike == int(strike) else f"{strike:.1f}"
     return f"QQQ {expiry.strftime('%y%m%d')}{ot}{strike_str}"
 
 
-def _round_strike(price: float, step: float, offset: int, option_type: str) -> float:
-    atm = round(price / step) * step
-    if option_type == "CALL":
-        return float(atm + offset * step)
-    else:
-        return float(atm - offset * step)
+def tradernet_option_ticker(option_type: str, strike: float, expiry: date) -> str:
+    """
+    Формат TraderNet: +QQQ.31JUL2026.C732 / +QQQ.31JUL2026.P735
+    Префикс '+' обязателен, день месяца с ведущим нулём (strftime %d).
+    """
+    ot = "C" if option_type == "CALL" else "P"
+    date_str = expiry.strftime("%d%b%Y").upper()   # 31JUL2026
+    strike_str = str(int(strike)) if strike == int(strike) else f"{strike:.2f}"
+    return f"+QQQ.{date_str}.{ot}{strike_str}"
 
 
 def _moneyness(option_type: str, strike: float, price: float, step: float) -> str:
@@ -130,127 +132,147 @@ def _moneyness(option_type: str, strike: float, price: float, step: float) -> st
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Основная логика позиции
+# Решение о действии
 # ────────────────────────────────────────────────────────────────────────────
 
 def _resolve_action(
-    signal: str,                        # "BUY" | "SELL"
-    position: Optional[OptionPosition], # текущая открытая позиция
-    can_short: bool = True,             # False для стратегий без шорта (напр. стратегия #2)
-) -> tuple[OptionActionType, str]:      # (action_type, option_type)
-    """
-    Определяет что нужно сделать с опционом.
-
-    can_short=True  (стратегия #1, двунаправленная):
-      BUY  при FLAT → OPEN CALL
-      SELL при FLAT → OPEN PUT
-      SELL при CALL → CLOSE CALL
-      BUY  при PUT  → CLOSE PUT
-      BUY  при CALL → HOLD CALL
-      SELL при PUT  → HOLD PUT
-
-    can_short=False (стратегия #2, только лонг):
-      BUY  при FLAT → OPEN CALL
-      SELL при FLAT → HOLD (нет позиции для закрытия, шорт не открываем)
-      SELL при CALL → CLOSE CALL
-      BUY  при CALL → HOLD CALL
-    """
+    signal: str,
+    position: Optional[OptionPosition],
+) -> tuple[OptionActionType, str]:
     if position is None:
-        if signal == "BUY":
-            return "OPEN", "CALL"
-        else:  # SELL
-            if can_short:
-                return "OPEN", "PUT"
-            else:
-                # Стратегия без шорта: SELL при FLAT — просто нет позиции
-                return "HOLD", "CALL"  # тип не важен, action=HOLD
-
+        return "OPEN", ("CALL" if signal == "BUY" else "PUT")
     if position.option_type == "CALL":
-        if signal == "SELL":
-            return "CLOSE", "CALL"
-        else:
-            return "HOLD", "CALL"
-
-    else:  # position.option_type == "PUT" (только стратегия #1)
-        if signal == "BUY":
-            return "CLOSE", "PUT"
-        else:
-            return "HOLD", "PUT"
-
-
-def tradernet_option_ticker(option_type: str, strike: float, expiry: date) -> str:
-    """
-    Формат TraderNet для запроса цены опциона: QQQ.17JUN2026.C749
-    Используется в get_quote_ltp чтобы получить рыночную цену опциона.
-    """
-    ot = "C" if option_type == "CALL" else "P"
-    date_str = expiry.strftime("%d%b%Y").upper()   # 17JUN2026
-    strike_str = str(int(strike)) if strike == int(strike) else f"{strike:.2f}"
-    return f"QQQ.{date_str}.{ot}{strike_str}"
+        return ("CLOSE", "CALL") if signal == "SELL" else ("HOLD", "CALL")
+    else:  # PUT
+        return ("CLOSE", "PUT") if signal == "BUY" else ("HOLD", "PUT")
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# TraderNet — попытка получить реальный тикер из цепочки
+# Выбор страйка по дельте
 # ────────────────────────────────────────────────────────────────────────────
 
-async def _try_tradernet_option(
-    session: aiohttp.ClientSession,
-    api_url: str,
-    underlying: str,
+async def _pick_strike_by_delta(
+    *,
+    tn,                              # TraderNetClient | None
+    cfg: OptionConfig,
     option_type: str,
-    strike: float,
+    spot: float,
     expiry: date,
-    sid: Optional[str],
-    timeout: int = 10,
-) -> Optional[str]:
-    payload: dict = {
-        "cmd": "getOptionChain",
-        "params": {"id": underlying, "type": option_type.lower()},
-    }
-    if sid:
-        payload["SID"] = sid
+    today: date,
+    atr: Optional[float],
+) -> tuple[float, Optional[float], str]:
+    """
+    Возвращает (strike, delta, delta_source).
 
-    try:
-        to = aiohttp.ClientTimeout(total=float(timeout))
-        async with session.post(
-            api_url,
-            data={"q": json.dumps(payload, ensure_ascii=False)},
-            timeout=to,
-            headers={"User-Agent": "qqq_trading_bot/2.0"},
-            cookies={"SID": sid} if sid else None,
-        ) as r:
-            if r.status != 200:
-                return None
-            data = json.loads(await r.text())
-    except Exception:
-        return None
+    Приоритет: TraderNet chain → Black-Scholes → аппроксимация.
+    """
+    target = cfg.target_delta
 
-    contracts = None
-    if isinstance(data, list):
-        contracts = data
-    elif isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, list) and v:
-                contracts = v
-                break
-
-    if not contracts:
-        return None
-
-    expiry_str = expiry.strftime("%Y-%m-%d")
-    for c in contracts:
-        if not isinstance(c, dict):
-            continue
-        c_strike = c.get("strike") or c.get("exercise_price")
-        c_expiry = c.get("expiry") or c.get("expiration") or c.get("exp_date")
-        c_ticker = c.get("ticker") or c.get("symbol") or c.get("id")
-        if c_strike is None or c_expiry is None or c_ticker is None:
-            continue
+    # 1) TraderNet цепочка с дельтами
+    if tn is not None:
         try:
-            if abs(float(c_strike) - strike) < 0.01 and expiry_str in str(c_expiry):
-                return str(c_ticker)
-        except (TypeError, ValueError):
-            continue
+            chain = await asyncio.wait_for(
+                tn.get_option_chain(cfg.underlying_symbol, option_type),
+                timeout=8.0,
+            )
+        except Exception:
+            chain = []
+
+        expiry_str = expiry.strftime("%Y-%m-%d")
+        with_delta = [
+            c for c in chain
+            if c.get("delta") is not None and c.get("strike") is not None
+            and (c.get("expiry") is None or expiry_str in str(c.get("expiry")))
+        ]
+        if with_delta:
+            best = min(with_delta, key=lambda c: abs(abs(c["delta"]) - target))
+            return float(best["strike"]), abs(float(best["delta"])), "tradernet"
+
+    # 2) Black-Scholes (волатильность из ATR)
+    t_years = years_to_expiry(expiry, today)
+    if t_years > 0 and atr is not None and atr > 0:
+        sigma = estimate_sigma_from_atr(atr, spot)
+        strike = strike_for_target_delta(
+            option_type, spot, target, t_years, sigma,
+            strike_step=cfg.strike_step, r=cfg.risk_free_rate,
+        )
+        actual_delta = bs_delta(option_type, spot, strike, t_years, sigma, cfg.risk_free_rate)
+        return strike, actual_delta, "black-scholes"
+
+    # 3) Аппроксимация: дельта ~0.375 ≈ страйк на ~1.5% от ATM в сторону OTM
+    offset_pct = 0.015
+    if option_type == "CALL":
+        raw = spot * (1.0 + offset_pct)
+    else:
+        raw = spot * (1.0 - offset_pct)
+    strike = round(raw / cfg.strike_step) * cfg.strike_step
+    return float(strike), None, "approx"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Поиск торгуемой экспирации
+# ────────────────────────────────────────────────────────────────────────────
+
+async def _find_tradable_expiry_and_strike(
+    *,
+    tn,
+    cfg: OptionConfig,
+    option_type: str,
+    spot: float,
+    today: date,
+    atr: Optional[float],
+) -> Optional[tuple[date, float, Optional[float], str]]:
+    """
+    Перебирает ближайшие пятницы, для каждой подбирает страйк по дельте
+    и проверяет что опцион реально торгуется в TraderNet.
+
+    Возвращает (expiry, strike, delta, delta_source) или None если ничего не найдено.
+
+    Если tn is None — не можем проверить существование, возвращаем первый расчёт.
+    """
+    base = today + timedelta(days=cfg.min_dte)
+    days_to_friday = (4 - base.weekday()) % 7
+    first_friday = base + timedelta(days=days_to_friday)
+
+    for i in range(cfg.max_expiry_tries):
+        expiry = first_friday + timedelta(days=7 * i)
+
+        strike, delta, delta_source = await _pick_strike_by_delta(
+            tn=tn, cfg=cfg, option_type=option_type,
+            spot=spot, expiry=expiry, today=today, atr=atr,
+        )
+
+        # Без TraderNet проверить не можем — возвращаем как есть
+        if tn is None:
+            return expiry, strike, delta, delta_source
+
+        # Проверяем существование опциона
+        tn_tick = tradernet_option_ticker(option_type, strike, expiry)
+        try:
+            exists = await asyncio.wait_for(tn.option_exists(tn_tick), timeout=8.0)
+        except Exception:
+            exists = False
+
+        if exists:
+            return expiry, strike, delta, delta_source
+
+        # Если страйк не торгуется — пробуем соседние ±1..2 шага на этой же экспирации
+        for delta_steps in (1, -1, 2, -2):
+            alt_strike = strike + delta_steps * cfg.strike_step
+            if alt_strike <= 0:
+                continue
+            alt_tick = tradernet_option_ticker(option_type, alt_strike, expiry)
+            try:
+                if await asyncio.wait_for(tn.option_exists(alt_tick), timeout=6.0):
+                    # пересчитываем дельту для альтернативного страйка
+                    t_years = years_to_expiry(expiry, today)
+                    alt_delta = None
+                    if t_years > 0 and atr and atr > 0:
+                        sigma = estimate_sigma_from_atr(atr, spot)
+                        alt_delta = bs_delta(option_type, spot, alt_strike, t_years, sigma, cfg.risk_free_rate)
+                    return expiry, alt_strike, alt_delta, delta_source
+            except Exception:
+                continue
 
     return None
 
@@ -260,56 +282,47 @@ async def _try_tradernet_option(
 # ────────────────────────────────────────────────────────────────────────────
 
 async def get_option_recommendation(
-    signal: str,                                    # "BUY" | "SELL"
+    signal: str,
     underlying_price: float,
     cfg: OptionConfig,
-    current_position: Optional[OptionPosition],     # текущая открытая позиция
-    can_short: bool = True,                         # False для стратегии #2 (только лонг)
-    session: Optional[aiohttp.ClientSession] = None,
-    api_url: str = "https://tradernet.ru/api/",
+    current_position: Optional[OptionPosition],
+    market_open: bool = True,        # основная сессия RTH открыта?
+    atr: Optional[float] = None,     # для оценки волатильности
+    tn=None,                         # TraderNetClient для проверки/цепочки
+    session: Optional[aiohttp.ClientSession] = None,  # legacy, не используется
+    api_url: str = "",
     sid: Optional[str] = None,
 ) -> OptionRecommendation:
     """
-    Возвращает рекомендацию с учётом текущей позиции.
-
-    CLOSE означает закрытие существующей позиции.
-    OPEN  означает открытие новой позиции (CALL или PUT в зависимости от can_short).
-    HOLD  означает что действие не требуется.
-
-    can_short=False (стратегия #2): SELL при FLAT → HOLD, PUT никогда не открывается.
+    Рекомендация с учётом позиции, рыночной сессии и существования контракта.
     """
-    action_type, option_type = _resolve_action(signal, current_position, can_short)
-
+    action_type, option_type = _resolve_action(signal, current_position)
     today = datetime.now(tz=timezone.utc).date()
 
-    # При CLOSE используем параметры текущей позиции (не пересчитываем страйк)
+    # ── CLOSE: используем параметры открытой позиции ──────────────────────
     if action_type == "CLOSE" and current_position is not None:
-        ticker = current_position.ticker
-        strike = current_position.strike
-        expiry = current_position.expiry
-        dte = _dte(expiry, today)
-        moneyness = _moneyness(option_type, strike, underlying_price, cfg.strike_step)
+        # Закрытие разрешено всегда (даже на премаркете — позицию надо уметь закрыть),
+        # но физически торговать опционами можно только в RTH. Помечаем флаг.
         return OptionRecommendation(
             action_type="CLOSE",
             option_type=option_type,
-            ticker=ticker,
+            ticker=current_position.ticker,
             tn_ticker=current_position.tn_ticker,
-            strike=strike,
-            expiry=expiry,
-            dte=dte,
+            strike=current_position.strike,
+            expiry=current_position.expiry,
+            dte=_dte(current_position.expiry, today),
             underlying_price=underlying_price,
-            moneyness=moneyness,
+            delta=None,
+            delta_source="-",
+            moneyness=_moneyness(option_type, current_position.strike, underlying_price, cfg.strike_step),
             source="position",
             new_position=None,
+            skipped_market_closed=(not market_open),
         )
 
-    # При HOLD — два случая:
-    #   1. Есть открытая позиция → возвращаем её без изменений
-    #   2. Нет позиции (SELL при FLAT, can_short=False) → возвращаем-заглушку без действия
+    # ── HOLD ──────────────────────────────────────────────────────────────
     if action_type == "HOLD":
         if current_position is not None:
-            dte = _dte(current_position.expiry, today)
-            moneyness = _moneyness(option_type, current_position.strike, underlying_price, cfg.strike_step)
             return OptionRecommendation(
                 action_type="HOLD",
                 option_type=option_type,
@@ -317,54 +330,65 @@ async def get_option_recommendation(
                 tn_ticker=current_position.tn_ticker,
                 strike=current_position.strike,
                 expiry=current_position.expiry,
-                dte=dte,
+                dte=_dte(current_position.expiry, today),
                 underlying_price=underlying_price,
-                moneyness=moneyness,
+                delta=None,
+                delta_source="-",
+                moneyness=_moneyness(option_type, current_position.strike, underlying_price, cfg.strike_step),
                 source="position",
                 new_position=current_position,
             )
         else:
-            # SELL при FLAT для стратегии без шорта — ничего не делать
-            expiry_stub = _next_expiry(today, cfg.min_dte)
+            stub_expiry = _next_friday(today, cfg.min_dte)
             return OptionRecommendation(
-                action_type="HOLD",
-                option_type="CALL",
-                ticker="-",
-                tn_ticker="-",
-                strike=0.0,
-                expiry=expiry_stub,
-                dte=_dte(expiry_stub, today),
-                underlying_price=underlying_price,
-                moneyness="-",
-                source="none",
+                action_type="HOLD", option_type="CALL",
+                ticker="-", tn_ticker="-", strike=0.0, expiry=stub_expiry,
+                dte=_dte(stub_expiry, today), underlying_price=underlying_price,
+                delta=None, delta_source="-", moneyness="-", source="none",
                 new_position=None,
             )
 
-    # OPEN — рассчитываем новый контракт
-    expiry = _next_expiry(today, cfg.min_dte)
+    # ── OPEN ────────────────────────────────────────────────────────────────
+    # Опционы открываем ТОЛЬКО в основную сессию.
+    if not market_open:
+        stub_expiry = _next_friday(today, cfg.min_dte)
+        return OptionRecommendation(
+            action_type="HOLD",          # действие не выполнено
+            option_type=option_type,
+            ticker="-", tn_ticker="-", strike=0.0, expiry=stub_expiry,
+            dte=_dte(stub_expiry, today), underlying_price=underlying_price,
+            delta=None, delta_source="-", moneyness="-", source="none",
+            new_position=None,            # позиция НЕ открывается
+            skipped_market_closed=True,
+        )
+
+    # Ищем торгуемую экспирацию + страйк по целевой дельте
+    found = await _find_tradable_expiry_and_strike(
+        tn=tn, cfg=cfg, option_type=option_type,
+        spot=underlying_price, today=today, atr=atr,
+    )
+
+    if found is None:
+        # Не нашли торгуемый контракт — не открываем позицию
+        stub_expiry = _next_friday(today, cfg.min_dte)
+        return OptionRecommendation(
+            action_type="HOLD", option_type=option_type,
+            ticker="-", tn_ticker="-", strike=0.0, expiry=stub_expiry,
+            dte=_dte(stub_expiry, today), underlying_price=underlying_price,
+            delta=None, delta_source="-", moneyness="-", source="none",
+            new_position=None,
+            skipped_no_contract=True,
+        )
+
+    expiry, strike, delta, delta_source = found
     dte = _dte(expiry, today)
-    strike = _round_strike(underlying_price, cfg.strike_step, cfg.strike_offset, option_type)
     moneyness = _moneyness(option_type, strike, underlying_price, cfg.strike_step)
-
-    tn_ticker: Optional[str] = None
-    if session is not None:
-        try:
-            tn_ticker = await asyncio.wait_for(
-                _try_tradernet_option(session, api_url, cfg.underlying_symbol,
-                                      option_type, strike, expiry, sid),
-                timeout=8.0,
-            )
-        except Exception:
-            tn_ticker = None
-
-    source = "tradernet" if tn_ticker else "calculated"
-    ticker = tn_ticker or _build_ticker(option_type, strike, expiry)
-
     tn_tick = tradernet_option_ticker(option_type, strike, expiry)
+    sh_tick = short_ticker(option_type, strike, expiry)
 
     new_position = OptionPosition(
         option_type=option_type,
-        ticker=ticker,
+        ticker=sh_tick,
         tn_ticker=tn_tick,
         strike=strike,
         expiry=expiry,
@@ -375,47 +399,60 @@ async def get_option_recommendation(
     return OptionRecommendation(
         action_type="OPEN",
         option_type=option_type,
-        ticker=ticker,
+        ticker=sh_tick,
         tn_ticker=tn_tick,
         strike=strike,
         expiry=expiry,
         dte=dte,
         underlying_price=underlying_price,
+        delta=delta,
+        delta_source=delta_source,
         moneyness=moneyness,
-        source=source,
+        source="tradernet" if tn is not None else "calculated",
         new_position=new_position,
     )
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Форматирование сообщения
+# Форматирование
 # ────────────────────────────────────────────────────────────────────────────
 
 def format_option_message(rec: OptionRecommendation) -> str:
-    """Форматирует блок для Telegram-сообщения (HTML)."""
+    if rec.skipped_market_closed and rec.action_type in ("HOLD", "OPEN"):
+        return (
+            "⏸ <b>Опцион: пропуск</b>\n"
+            "Рынок опционов закрыт (вне основной сессии 9:30–16:00 ET).\n"
+            "Сигнал зафиксирован, опцион откроется при подтверждении в RTH."
+        )
+    if rec.skipped_no_contract:
+        return (
+            "⚠️ <b>Опцион: контракт не найден</b>\n"
+            "Не удалось найти торгуемый опцион с нужной экспирацией/страйком."
+        )
 
     if rec.action_type == "OPEN":
         emoji = "📈" if rec.option_type == "CALL" else "📉"
         header = f"{emoji} <b>Опцион: ОТКРЫТЬ {rec.option_type}</b>"
     elif rec.action_type == "CLOSE":
-        emoji = "🔒"
-        header = f"{emoji} <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
+        header = f"🔒 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
+        if rec.skipped_market_closed:
+            header += "\n⚠️ рынок опционов закрыт — закрытие при открытии RTH"
     else:  # HOLD
-        emoji = "⏸"
         if rec.new_position is not None:
-            header = f"{emoji} <b>Опцион: ДЕРЖАТЬ {rec.option_type}</b> (уже в позиции)"
+            header = f"⏸ <b>Опцион: ДЕРЖАТЬ {rec.option_type}</b> (уже в позиции)"
         else:
-            header = f"{emoji} <b>Опцион: нет действия</b> (позиция не открыта, шорт не используется)"
+            return "⏸ <b>Опцион: нет действия</b>"
 
     lines = [
         header,
         f"Тикер: <code>{rec.ticker}</code>",
+        f"TraderNet: <code>{rec.tn_ticker}</code>",
         f"Страйк: {rec.strike:.0f}  |  {rec.moneyness}",
+    ]
+    if rec.delta is not None:
+        lines.append(f"Дельта: {rec.delta:.3f}  (источник: {rec.delta_source})")
+    lines += [
         f"Экспирация: {rec.expiry.strftime('%d %b %Y')}  ({rec.dte} DTE)",
         f"QQQ сейчас: {rec.underlying_price:.2f}",
     ]
-
-    if rec.action_type != "OPEN":
-        lines.append(f"Источник тикера: {rec.source}")
-
     return "\n".join(lines)

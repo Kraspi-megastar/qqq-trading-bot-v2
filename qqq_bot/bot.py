@@ -1,10 +1,14 @@
 """
 bot.py — точка входа.
 
-Опционные сделки:
-  - При OPEN: запрашиваем цену опциона через TraderNet, открываем TradeRecord.
-  - При CLOSE: запрашиваем цену, закрываем TradeRecord, считаем P&L.
-  - При HOLD: ничего не делаем с журналом.
+Опционная рекомендация (rec) вычисляется в scheduler.polling_loop ДО отправки,
+и передаётся сюда готовой. Здесь только:
+  - запись сделки в журнал (с реальной ценой опциона из TraderNet),
+  - применение новой позиции,
+  - форматирование и отправка сообщения.
+
+Сообщение приходит сюда ТОЛЬКО когда позиция реально меняется (OPEN/CLOSE) —
+HOLD и пропуски из-за закрытого рынка отсекаются в scheduler.
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ from .tradernet import TraderNetClient
 from .scheduler import AppState, bootstrap_history, polling_loop
 from .handlers import router
 from .signals import SignalDecision
-from .options import get_option_recommendation, format_option_message, OptionConfig as _OC
+from .options import OptionRecommendation, format_option_message
 from .trades import TradeJournal
 
 
@@ -33,10 +37,15 @@ def _fmt_ts_z(dt) -> str:
 
 
 async def _fetch_option_price(tn: TraderNetClient, tn_ticker: str) -> float | None:
-    """Запрашивает рыночную цену опциона из TraderNet. None при ошибке."""
     try:
-        price = await asyncio.wait_for(tn.get_quote_ltp(tn_ticker), timeout=8.0)
-        return float(price) if price else None
+        q = await asyncio.wait_for(tn.get_option_quote(tn_ticker), timeout=8.0)
+        if q is None:
+            return None
+        # предпочитаем mid(bid,ask), иначе ltp
+        bid, ask, ltp = q.get("bid"), q.get("ask"), q.get("ltp")
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            return round((bid + ask) / 2, 4)
+        return ltp
     except Exception:
         return None
 
@@ -47,6 +56,7 @@ async def _send_signal_to_channel(
     decision: SignalDecision,
     chart_path: str,
     df_sig,
+    rec: OptionRecommendation | None,
     session: aiohttp.ClientSession,
 ) -> None:
     import pandas as pd
@@ -62,24 +72,21 @@ async def _send_signal_to_channel(
         v = last[col]
         return float(v) if pd.notna(v) else None
 
-    close    = _fv("close")
-    ts       = last["ts"] if last is not None else None
-    rsi_v    = _fv("rsi")
-    ema_f    = _fv("ema_fast")
-    ema_sl   = _fv("ema_slow")
-    bb_l     = _fv("bb_lower")
-    bb_m     = _fv("bb_mid")
-    bb_u     = _fv("bb_upper")
+    close  = _fv("close")
+    ts     = last["ts"] if last is not None else None
+    rsi_v  = _fv("rsi")
+    ema_f  = _fv("ema_fast")
+    ema_sl = _fv("ema_slow")
+    bb_l   = _fv("bb_lower")
+    bb_m   = _fv("bb_mid")
+    bb_u   = _fv("bb_upper")
 
     lines = [
         f"<b>{html.escape(direction)}</b>",
         f"<b>{html.escape(app.cfg.symbol)}</b>  TF={app.cfg.timeframe_minutes}m  STR=#{app.strategy_id}",
         html.escape(f"BarTS={_fmt_ts_z(ts)}"),
         html.escape(f"Close={close:.4f}" if isinstance(close, float) else "Close=n/a"),
-        html.escape(
-            f"RSI({s.rsi_period})={rsi_v:.2f}"
-            if isinstance(rsi_v, float) else f"RSI({s.rsi_period})=n/a"
-        ),
+        html.escape(f"RSI({s.rsi_period})={rsi_v:.2f}" if isinstance(rsi_v, float) else f"RSI({s.rsi_period})=n/a"),
         html.escape(
             f"EMA{s.ema_fast}={ema_f:.2f} | EMA{s.ema_slow}={ema_sl:.2f}"
             if isinstance(ema_f, float) and isinstance(ema_sl, float) else "EMA=n/a"
@@ -90,77 +97,47 @@ async def _send_signal_to_channel(
         ),
     ]
 
-    if app.strategy_id == 2:
-        atr_stop = app.strategy2.atr_stop
-        if atr_stop is not None:
-            lines.append(html.escape(f"ATR-Stop={atr_stop:.2f}"))
+    if app.strategy_id == 2 and app.strategy2.atr_stop is not None:
+        lines.append(html.escape(f"ATR-Stop={app.strategy2.atr_stop:.2f}"))
 
     lines += ["", f"<i>{html.escape(decision.reason)}</i>"]
 
-    # ── Опционный блок ────────────────────────────────────────────────────
-    if app.cfg.option.enabled and isinstance(close, float):
-        try:
-            oc = app.cfg.option
-            opt_cfg = _OC(
-                enabled=oc.enabled,
-                min_dte=oc.min_dte,
-                strike_step=oc.strike_step,
-                strike_offset=oc.strike_offset,
-                underlying_symbol=oc.underlying_symbol,
-            )
-            rec = await get_option_recommendation(
-                signal=decision.action,
-                underlying_price=close,
-                cfg=opt_cfg,
-                current_position=app.option_position,
-                can_short=True,
-                session=session,
-                api_url=app.cfg.tradernet_api_url,
-                sid=app.cfg.tradernet_sid,
-            )
+    # ── Опционная часть ────────────────────────────────────────────────────
+    if rec is not None:
+        now_utc = datetime.now(tz=timezone.utc)
+        session_date = getattr(app.stats, "session_id", None) or now_utc.date().isoformat()
 
-            now_utc = datetime.now(tz=timezone.utc)
-            session_date = getattr(app.stats, "session_id", None) or now_utc.date().isoformat()
+        if app.trade_journal is not None:
+            if rec.action_type == "OPEN":
+                opt_price = await _fetch_option_price(app.tn, rec.tn_ticker)
+                app.trade_journal.open_trade(
+                    session_date=session_date,
+                    option_type=rec.option_type,
+                    ticker=rec.tn_ticker,
+                    strike=rec.strike,
+                    expiry=rec.expiry,
+                    dte_at_entry=rec.dte,
+                    entry_price=opt_price,
+                    entry_underlying=rec.underlying_price,
+                    entry_ts=now_utc,
+                )
+            elif rec.action_type == "CLOSE" and app.option_position is not None:
+                opt_price = await _fetch_option_price(app.tn, rec.tn_ticker)
+                closed = app.trade_journal.close_trade(
+                    ticker=rec.tn_ticker,
+                    exit_price=opt_price,
+                    exit_underlying=rec.underlying_price,
+                    exit_ts=now_utc,
+                )
+                if closed is not None:
+                    lines.append(html.escape(f"P&L сделки: {closed.pnl_str()}"))
 
-            # ── Запись сделки в журнал ─────────────────────────────────────
-            if app.trade_journal is not None:
-                if rec.action_type == "OPEN":
-                    opt_price = await _fetch_option_price(app.tn, rec.tn_ticker)
-                    app.trade_journal.open_trade(
-                        session_date=session_date,
-                        option_type=rec.option_type,
-                        ticker=rec.tn_ticker,
-                        strike=rec.strike,
-                        expiry=rec.expiry,
-                        dte_at_entry=rec.dte,
-                        entry_price=opt_price,
-                        entry_underlying=close,
-                        entry_ts=now_utc,
-                    )
-                elif rec.action_type == "CLOSE" and app.option_position is not None:
-                    opt_price = await _fetch_option_price(app.tn, rec.tn_ticker)
-                    closed = app.trade_journal.close_trade(
-                        ticker=rec.tn_ticker,
-                        exit_price=opt_price,
-                        exit_underlying=close,
-                        exit_ts=now_utc,
-                    )
-                    # Добавляем P&L в сообщение
-                    if closed is not None:
-                        pnl_str = closed.pnl_str()
-                        lines.append(html.escape(f"P&L сделки: {pnl_str}"))
+        # Применяем новую позицию
+        app.option_position = rec.new_position
 
-            # Применяем новую позицию
-            app.option_position = rec.new_position
-
-            if not (rec.action_type == "HOLD" and rec.new_position is None):
-                lines += ["", format_option_message(rec)]
-
-        except Exception as e:
-            lines += ["", html.escape(f"[Опцион: ошибка — {e}]")]
+        lines += ["", format_option_message(rec)]
 
     caption = "\n".join(lines)
-
     await bot.send_photo(
         chat_id=app.cfg.telegram_channel_id,
         photo=FSInputFile(chart_path),
@@ -172,17 +149,11 @@ async def _send_signal_to_channel(
 async def _amain() -> None:
     cfg = load_config()
 
-    bot = Bot(
-        token=cfg.telegram_bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=cfg.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
 
-    cache = BarCache(
-        timeframe_minutes=cfg.timeframe_minutes,
-        maxlen=max(cfg.chart_bars * 5, 2000),
-    )
+    cache = BarCache(timeframe_minutes=cfg.timeframe_minutes, maxlen=max(cfg.chart_bars * 5, 2000))
     stats = Stats()
 
     async with aiohttp.ClientSession() as session:
@@ -201,8 +172,8 @@ async def _amain() -> None:
 
         asyncio.create_task(bootstrap_history(app))
 
-        async def sender(decision: SignalDecision, chart_path: str, df_sig) -> None:
-            await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, session)
+        async def sender(decision: SignalDecision, chart_path: str, df_sig, rec=None) -> None:
+            await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, rec, session)
 
         asyncio.create_task(polling_loop(app, sender))
 

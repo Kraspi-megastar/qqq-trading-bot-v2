@@ -43,12 +43,14 @@ class SignalConfig:
 
 @dataclass(frozen=True)
 class OptionConfig:
-    """Настройки генерации опционных сигналов (стратегия #1)."""
+    """Настройки генерации опционных сигналов."""
     enabled: bool = True
     min_dte: int = 1               # минимум дней до экспирации
     strike_step: float = 1.0       # шаг страйка ($1 для QQQ)
-    strike_offset: int = 0         # 0=ATM, 1=1 шаг OTM и т.д.
     underlying_symbol: str = "QQQ.US"
+    target_delta: float = 0.375    # целевая дельта для выбора страйка (0.35–0.40)
+    max_expiry_tries: int = 4      # сколько пятниц перебрать в поисках торгуемой экспирации
+    risk_free_rate: float = 0.05   # безрисковая ставка для Black-Scholes
 
 
 @dataclass(frozen=True)
@@ -123,8 +125,10 @@ def load_config() -> AppConfig:
         enabled=os.getenv("OPTION_SIGNALS_ENABLED", "1") == "1",
         min_dte=int(os.getenv("OPTION_MIN_DTE", "1")),
         strike_step=float(os.getenv("OPTION_STRIKE_STEP", "1.0")),
-        strike_offset=int(os.getenv("OPTION_STRIKE_OFFSET", "0")),
         underlying_symbol=os.getenv("OPTION_UNDERLYING", "QQQ.US"),
+        target_delta=float(os.getenv("OPTION_TARGET_DELTA", "0.375")),
+        max_expiry_tries=int(os.getenv("OPTION_MAX_EXPIRY_TRIES", "4")),
+        risk_free_rate=float(os.getenv("OPTION_RISK_FREE_RATE", "0.05")),
     )
 
     return AppConfig(

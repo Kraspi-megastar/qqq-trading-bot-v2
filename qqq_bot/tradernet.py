@@ -60,6 +60,98 @@ class TraderNetClient:
             raise RuntimeError(f"Quote missing ltp: {txt[:200]}")
         return float(data[0]["ltp"])
 
+    async def get_option_quote(self, option_ticker: str) -> dict | None:
+        """
+        Запрашивает котировку опциона (ltp, bid, ask, delta если есть).
+        Возвращает dict или None если опцион не торгуется / не существует.
+
+        option_ticker — формат TraderNet, напр. QQQ.19JUN2026.C480
+        """
+        params = {"params": "ltp,bid,ask,delta,oi,vol", "tickers": option_ticker}
+        try:
+            async with self.session.get(self.quotes_url, params=params, timeout=10) as r:
+                if r.status != 200:
+                    return None
+                data = json.loads(await r.text())
+        except Exception:
+            return None
+
+        if not isinstance(data, list) or not data:
+            return None
+
+        row = data[0]
+        # Опцион считается существующим только если есть хоть какая-то цена
+        ltp = safe_float(row.get("ltp"))
+        bid = safe_float(row.get("bid"))
+        ask = safe_float(row.get("ask"))
+        if ltp is None and bid is None and ask is None:
+            return None
+
+        return {
+            "ticker": option_ticker,
+            "ltp": ltp,
+            "bid": bid,
+            "ask": ask,
+            "delta": safe_float(row.get("delta")),
+            "oi": safe_float(row.get("oi")),
+            "vol": safe_float(row.get("vol")),
+        }
+
+    async def option_exists(self, option_ticker: str) -> bool:
+        """True если по опциону есть рыночная котировка (значит он реально торгуется)."""
+        q = await self.get_option_quote(option_ticker)
+        return q is not None
+
+    async def get_option_chain(self, underlying: str, option_type: str) -> list[dict]:
+        """
+        Запрашивает опционную цепочку через API getOptionChain.
+        Возвращает список контрактов с полями strike, expiry, ticker, delta (если есть).
+        Пустой список если API недоступен.
+        """
+        payload = {
+            "cmd": "getOptionChain",
+            "params": {"id": underlying, "type": option_type.lower()},
+        }
+        if self.sid:
+            payload["SID"] = self.sid
+
+        try:
+            async with self.session.post(
+                self.api_url,
+                data={"q": json.dumps(payload, ensure_ascii=False)},
+                timeout=self.timeout_seconds,
+                headers={"User-Agent": "qqq_trading_bot/3.0"},
+                cookies={"SID": self.sid} if self.sid else None,
+            ) as r:
+                if r.status != 200:
+                    return []
+                data = json.loads(await r.text())
+        except Exception:
+            return []
+
+        contracts = None
+        if isinstance(data, list):
+            contracts = data
+        elif isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list) and v:
+                    contracts = v
+                    break
+        if not contracts:
+            return []
+
+        result = []
+        for c in contracts:
+            if not isinstance(c, dict):
+                continue
+            result.append({
+                "strike": safe_float(c.get("strike") or c.get("exercise_price")),
+                "expiry": c.get("expiry") or c.get("expiration") or c.get("exp_date"),
+                "ticker": c.get("ticker") or c.get("symbol") or c.get("id"),
+                "delta": safe_float(c.get("delta")),
+            })
+        return result
+
     async def get_hloc(
         self,
         symbol: str,
