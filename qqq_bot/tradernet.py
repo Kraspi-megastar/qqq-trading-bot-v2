@@ -60,131 +60,120 @@ class TraderNetClient:
             raise RuntimeError(f"Quote missing ltp: {txt[:200]}")
         return float(data[0]["ltp"])
 
+    async def get_security_info(self, ticker: str) -> dict | None:
+        """
+        getSecurityInfo — подробная информация по инструменту (акция или опцион).
+        Для опционов возвращает ltp/bid/ask, греки (delta, gamma, theta, vega, rho),
+        iv, strike_price, option_type, mtd (дата экспирации), marketStatus.
+
+        Требует авторизации (SID). Возвращает dict или None при ошибке.
+        """
+        payload = {"cmd": "getSecurityInfo", "params": {"ticker": ticker}}
+        if self.sid:
+            payload["SID"] = self.sid
+
+        urls = [self.api_url] + [u for u in self.alt_api_urls if u != self.api_url]
+        timeout = aiohttp.ClientTimeout(total=float(max(5, int(self.timeout_seconds))))
+        headers = {"User-Agent": "qqq_trading_bot/3.0"}
+        cookies = {"SID": self.sid} if self.sid else None
+
+        for url in urls:
+            try:
+                async with self.session.post(
+                    url,
+                    data={"q": json.dumps(payload, ensure_ascii=False)},
+                    timeout=timeout,
+                    headers=headers,
+                    cookies=cookies,
+                ) as r:
+                    if r.status != 200:
+                        continue
+                    data = json.loads(await r.text())
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+            # Ошибка API: {"error": "...", "code": ...}
+            if data.get("error"):
+                return None
+            # Признак валидного ответа — наличие кода инструмента "c"
+            if "c" in data or "ltp" in data:
+                return data
+        return None
+
     async def get_option_quote(self, option_ticker: str) -> dict | None:
         """
-        Запрашивает котировку опциона (ltp, bid, ask, delta если есть).
-        Возвращает dict или None если опцион не торгуется / не существует.
-
-        TraderNet может вернуть данные в разных формах:
-          - [{"ltp":..,"bid":..}]            — список словарей (как у акций)
-          - [["+QQQ...", ..]]                — список списков (позиционный формат)
-          - {"+QQQ...": {...}}               — словарь по тикеру
-        Парсер устойчив ко всем трём.
+        Котировка опциона через getSecurityInfo.
+        Возвращает dict с ltp/bid/ask/delta/греками или None если опцион
+        не торгуется / не существует.
         """
-        params = {"params": "ltp,bid,ask,delta,oi,vol", "tickers": option_ticker}
-        try:
-            async with self.session.get(self.quotes_url, params=params, timeout=10) as r:
-                if r.status != 200:
-                    return None
-                data = json.loads(await r.text())
-        except Exception:
+        info = await self.get_security_info(option_ticker)
+        if info is None:
             return None
 
-        row = None
+        ltp = safe_float(info.get("ltp"))
+        bid = safe_float(info.get("bbp"))   # best bid price
+        ask = safe_float(info.get("bap"))   # best ask price
 
-        if isinstance(data, dict):
-            # формат {"+QQQ...": {...}} или {ltp:..,..}
-            if option_ticker in data and isinstance(data[option_ticker], dict):
-                row = data[option_ticker]
-            elif "ltp" in data or "bid" in data or "ask" in data:
-                row = data
-            else:
-                # берём первый словарь среди значений
-                for v in data.values():
-                    if isinstance(v, dict):
-                        row = v
-                        break
-        elif isinstance(data, list) and data:
-            first = data[0]
-            if isinstance(first, dict):
-                row = first
-            elif isinstance(first, list):
-                # позиционный формат — не знаем порядок полей наверняка,
-                # возвращаем None для парсинга, но raw покажет структуру
-                return None
-
-        if not isinstance(row, dict):
-            return None
-
-        ltp = safe_float(row.get("ltp"))
-        bid = safe_float(row.get("bid"))
-        ask = safe_float(row.get("ask"))
-        if ltp is None and bid is None and ask is None:
-            return None
-
+        # Опцион существует, но цены может не быть (неликвид) — это ок,
+        # вернём что есть; None только если вообще нет данных об инструменте.
         return {
             "ticker": option_ticker,
             "ltp": ltp,
             "bid": bid,
             "ask": ask,
-            "delta": safe_float(row.get("delta")),
-            "oi": safe_float(row.get("oi")),
-            "vol": safe_float(row.get("vol")),
+            "delta": safe_float(info.get("delta")),
+            "gamma": safe_float(info.get("gamma")),
+            "theta": safe_float(info.get("theta")),
+            "vega": safe_float(info.get("vega")),
+            "iv": safe_float(info.get("iv")),
+            "strike": safe_float(info.get("strike_price")),
+            "option_type": info.get("option_type"),
+            "expiry": info.get("mtd"),
+            "market_status": info.get("marketStatus"),
+            "multiplier": safe_float(info.get("contract_multiplier")) or 100.0,
         }
 
     async def get_option_quote_raw(self, option_ticker: str) -> str:
-        """Диагностика: возвращает сырой текст ответа quotes_url для опционного тикера."""
-        params = {"params": "ltp,bid,ask,delta,oi,vol", "tickers": option_ticker}
-        try:
-            async with self.session.get(self.quotes_url, params=params, timeout=10) as r:
-                return f"HTTP {r.status}\n" + (await r.text())[:800]
-        except Exception as e:
-            return f"ERROR: {e!r}"
+        """Диагностика: сырой ответ getSecurityInfo по опционному тикеру."""
+        info = await self.get_security_info(option_ticker)
+        if info is None:
+            return "None (нет данных / ошибка API / неверный тикер)"
+        # показываем только ключевые поля чтобы не раздувать сообщение
+        keys = ["c", "ltp", "bbp", "bap", "delta", "gamma", "theta", "vega",
+                "iv", "strike_price", "option_type", "mtd", "marketStatus",
+                "contract_multiplier"]
+        shown = {k: info.get(k) for k in keys if k in info}
+        return json.dumps(shown, ensure_ascii=False, indent=2)
 
     async def option_exists(self, option_ticker: str) -> bool:
-        """True если по опциону есть рыночная котировка (значит он реально торгуется)."""
-        q = await self.get_option_quote(option_ticker)
-        return q is not None
+        """
+        True если опцион реально существует и торгуется.
+        Критерий: getSecurityInfo вернул инструмент с непустой ценой И
+        статусом рынка, либо хотя бы ненулевой ltp/ask.
+        """
+        info = await self.get_security_info(option_ticker)
+        if info is None:
+            return False
+        ltp = safe_float(info.get("ltp"))
+        ask = safe_float(info.get("bap"))
+        bid = safe_float(info.get("bbp"))
+        # существует, если есть хоть какая-то котировка
+        return any(v is not None and v > 0 for v in (ltp, ask, bid))
 
-    async def get_option_chain(self, underlying: str, option_type: str) -> list[dict]:
-        """
-        Запрашивает опционную цепочку через API getOptionChain.
-        Возвращает список контрактов с полями strike, expiry, ticker, delta (если есть).
-        Пустой список если API недоступен.
-        """
-        payload = {
-            "cmd": "getOptionChain",
-            "params": {"id": underlying, "type": option_type.lower()},
+    async def get_option_greeks(self, option_ticker: str) -> dict | None:
+        """Возвращает {delta, gamma, theta, vega, iv} или None."""
+        info = await self.get_security_info(option_ticker)
+        if info is None:
+            return None
+        return {
+            "delta": safe_float(info.get("delta")),
+            "gamma": safe_float(info.get("gamma")),
+            "theta": safe_float(info.get("theta")),
+            "vega": safe_float(info.get("vega")),
+            "iv": safe_float(info.get("iv")),
         }
-        if self.sid:
-            payload["SID"] = self.sid
-
-        try:
-            async with self.session.post(
-                self.api_url,
-                data={"q": json.dumps(payload, ensure_ascii=False)},
-                timeout=self.timeout_seconds,
-                headers={"User-Agent": "qqq_trading_bot/3.0"},
-                cookies={"SID": self.sid} if self.sid else None,
-            ) as r:
-                if r.status != 200:
-                    return []
-                data = json.loads(await r.text())
-        except Exception:
-            return []
-
-        contracts = None
-        if isinstance(data, list):
-            contracts = data
-        elif isinstance(data, dict):
-            for v in data.values():
-                if isinstance(v, list) and v:
-                    contracts = v
-                    break
-        if not contracts:
-            return []
-
-        result = []
-        for c in contracts:
-            if not isinstance(c, dict):
-                continue
-            result.append({
-                "strike": safe_float(c.get("strike") or c.get("exercise_price")),
-                "expiry": c.get("expiry") or c.get("expiration") or c.get("exp_date"),
-                "ticker": c.get("ticker") or c.get("symbol") or c.get("id"),
-                "delta": safe_float(c.get("delta")),
-            })
-        return result
 
     async def get_hloc(
         self,

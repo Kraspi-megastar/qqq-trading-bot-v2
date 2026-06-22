@@ -168,42 +168,66 @@ async def _pick_strike_by_delta(
     """
     Возвращает (strike, delta, delta_source).
 
-    Приоритет: TraderNet chain → Black-Scholes → аппроксимация.
+    Приоритет:
+      1) TraderNet getSecurityInfo — пробуем страйки вокруг оценки BS и читаем
+         РЕАЛЬНУЮ дельту каждого контракта, выбираем ближайший к target_delta.
+      2) Black-Scholes (волатильность из ATR).
+      3) Аппроксимация по расстоянию от ATM.
     """
     target = cfg.target_delta
 
-    # 1) TraderNet цепочка с дельтами
-    if tn is not None:
-        try:
-            chain = await asyncio.wait_for(
-                tn.get_option_chain(cfg.underlying_symbol, option_type),
-                timeout=8.0,
-            )
-        except Exception:
-            chain = []
-
-        expiry_str = expiry.strftime("%Y-%m-%d")
-        with_delta = [
-            c for c in chain
-            if c.get("delta") is not None and c.get("strike") is not None
-            and (c.get("expiry") is None or expiry_str in str(c.get("expiry")))
-        ]
-        if with_delta:
-            best = min(with_delta, key=lambda c: abs(abs(c["delta"]) - target))
-            return float(best["strike"]), abs(float(best["delta"])), "tradernet"
-
-    # 2) Black-Scholes (волатильность из ATR)
+    # Предварительная оценка страйка по BS (чтобы знать где искать в цепочке)
     t_years = years_to_expiry(expiry, today)
-    if t_years > 0 and atr is not None and atr > 0:
-        sigma = estimate_sigma_from_atr(atr, spot)
-        strike = strike_for_target_delta(
+    sigma = estimate_sigma_from_atr(atr, spot) if (atr and atr > 0) else 0.25
+    if t_years > 0:
+        bs_strike = strike_for_target_delta(
             option_type, spot, target, t_years, sigma,
             strike_step=cfg.strike_step, r=cfg.risk_free_rate,
         )
-        actual_delta = bs_delta(option_type, spot, strike, t_years, sigma, cfg.risk_free_rate)
-        return strike, actual_delta, "black-scholes"
+    else:
+        bs_strike = round(spot / cfg.strike_step) * cfg.strike_step
 
-    # 3) Аппроксимация: дельта ~0.375 ≈ страйк на ~1.5% от ATM в сторону OTM
+    # 1) Реальные дельты из TraderNet — пробуем страйки вокруг bs_strike
+    if tn is not None:
+        best_strike = None
+        best_delta = None
+        best_diff = float("inf")
+        # перебираем страйки в окне ±5 шагов вокруг расчётного
+        steps = sorted(range(-5, 6), key=lambda k: abs(k))
+        checked = 0
+        for k in steps:
+            cand = bs_strike + k * cfg.strike_step
+            if cand <= 0:
+                continue
+            tn_tick = tradernet_option_ticker(option_type, cand, expiry)
+            try:
+                greeks = await asyncio.wait_for(tn.get_option_greeks(tn_tick), timeout=6.0)
+            except Exception:
+                greeks = None
+            if greeks is None or greeks.get("delta") is None:
+                continue
+            checked += 1
+            d = abs(float(greeks["delta"]))
+            diff = abs(d - target)
+            if diff < best_diff:
+                best_diff = diff
+                best_strike = cand
+                best_delta = d
+            # ранний выход: попали в целевой диапазон 0.35–0.40
+            if 0.34 <= d <= 0.41:
+                return float(cand), d, "tradernet"
+            # ограничим число сетевых запросов
+            if checked >= 8:
+                break
+        if best_strike is not None:
+            return float(best_strike), best_delta, "tradernet"
+
+    # 2) Black-Scholes
+    if t_years > 0 and atr is not None and atr > 0:
+        actual_delta = bs_delta(option_type, spot, bs_strike, t_years, sigma, cfg.risk_free_rate)
+        return bs_strike, actual_delta, "black-scholes"
+
+    # 3) Аппроксимация
     offset_pct = 0.015
     if option_type == "CALL":
         raw = spot * (1.0 + offset_pct)
