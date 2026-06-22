@@ -496,11 +496,15 @@ async def cmd_optest(message: Message, app: AppState) -> None:
         ticker = tradernet_option_ticker("CALL", strike, friday)
 
     raw = await app.tn.get_option_quote_raw(ticker)
-    parsed = await app.tn.get_option_quote(ticker)
+    try:
+        parsed = await app.tn.get_option_quote(ticker)
+        parsed_str = str(parsed)
+    except Exception as e:
+        parsed_str = f"ошибка парсинга: {e!r}"
 
     txt = (
         f"Тикер: {ticker}\n\n"
-        f"Распарсено: {parsed}\n\n"
+        f"Распарсено: {parsed_str}\n\n"
         f"Сырой ответ:\n{raw}"
     )
     await message.answer("<pre>" + html.escape(txt) + "</pre>")

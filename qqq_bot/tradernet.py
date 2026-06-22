@@ -65,7 +65,11 @@ class TraderNetClient:
         Запрашивает котировку опциона (ltp, bid, ask, delta если есть).
         Возвращает dict или None если опцион не торгуется / не существует.
 
-        option_ticker — формат TraderNet, напр. QQQ.19JUN2026.C480
+        TraderNet может вернуть данные в разных формах:
+          - [{"ltp":..,"bid":..}]            — список словарей (как у акций)
+          - [["+QQQ...", ..]]                — список списков (позиционный формат)
+          - {"+QQQ...": {...}}               — словарь по тикеру
+        Парсер устойчив ко всем трём.
         """
         params = {"params": "ltp,bid,ask,delta,oi,vol", "tickers": option_ticker}
         try:
@@ -76,11 +80,32 @@ class TraderNetClient:
         except Exception:
             return None
 
-        if not isinstance(data, list) or not data:
+        row = None
+
+        if isinstance(data, dict):
+            # формат {"+QQQ...": {...}} или {ltp:..,..}
+            if option_ticker in data and isinstance(data[option_ticker], dict):
+                row = data[option_ticker]
+            elif "ltp" in data or "bid" in data or "ask" in data:
+                row = data
+            else:
+                # берём первый словарь среди значений
+                for v in data.values():
+                    if isinstance(v, dict):
+                        row = v
+                        break
+        elif isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                row = first
+            elif isinstance(first, list):
+                # позиционный формат — не знаем порядок полей наверняка,
+                # возвращаем None для парсинга, но raw покажет структуру
+                return None
+
+        if not isinstance(row, dict):
             return None
 
-        row = data[0]
-        # Опцион считается существующим только если есть хоть какая-то цена
         ltp = safe_float(row.get("ltp"))
         bid = safe_float(row.get("bid"))
         ask = safe_float(row.get("ask"))
