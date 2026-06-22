@@ -97,6 +97,15 @@ class TraderNetClient:
             "vol": safe_float(row.get("vol")),
         }
 
+    async def get_option_quote_raw(self, option_ticker: str) -> str:
+        """Диагностика: возвращает сырой текст ответа quotes_url для опционного тикера."""
+        params = {"params": "ltp,bid,ask,delta,oi,vol", "tickers": option_ticker}
+        try:
+            async with self.session.get(self.quotes_url, params=params, timeout=10) as r:
+                return f"HTTP {r.status}\n" + (await r.text())[:800]
+        except Exception as e:
+            return f"ERROR: {e!r}"
+
     async def option_exists(self, option_ticker: str) -> bool:
         """True если по опциону есть рыночная котировка (значит он реально торгуется)."""
         q = await self.get_option_quote(option_ticker)

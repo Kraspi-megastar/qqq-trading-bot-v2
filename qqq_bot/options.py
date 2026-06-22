@@ -68,6 +68,10 @@ class OptionConfig:
     max_expiry_tries: int = 4
     # Безрисковая ставка для Black-Scholes
     risk_free_rate: float = 0.05
+    # Если True — НЕ открывать позицию пока TraderNet не подтвердит существование
+    # контракта. Если False (по умолчанию) — при неудачной проверке открываем
+    # по расчётному тикеру (валидация не должна глушить все сигналы).
+    require_validation: bool = False
 
 
 @dataclass
@@ -234,6 +238,10 @@ async def _find_tradable_expiry_and_strike(
     days_to_friday = (4 - base.weekday()) % 7
     first_friday = base + timedelta(days=days_to_friday)
 
+    # Запоминаем самый первый расчётный вариант — используем как fallback,
+    # если ни один страйк не удалось ПОДТВЕРДИТЬ через TraderNet.
+    fallback: Optional[tuple[date, float, Optional[float], str]] = None
+
     for i in range(cfg.max_expiry_tries):
         expiry = first_friday + timedelta(days=7 * i)
 
@@ -242,7 +250,10 @@ async def _find_tradable_expiry_and_strike(
             spot=spot, expiry=expiry, today=today, atr=atr,
         )
 
-        # Без TraderNet проверить не можем — возвращаем как есть
+        if fallback is None:
+            fallback = (expiry, strike, delta, delta_source)
+
+        # Без TraderNet проверить не можем — возвращаем расчёт как есть
         if tn is None:
             return expiry, strike, delta, delta_source
 
@@ -264,7 +275,6 @@ async def _find_tradable_expiry_and_strike(
             alt_tick = tradernet_option_ticker(option_type, alt_strike, expiry)
             try:
                 if await asyncio.wait_for(tn.option_exists(alt_tick), timeout=6.0):
-                    # пересчитываем дельту для альтернативного страйка
                     t_years = years_to_expiry(expiry, today)
                     alt_delta = None
                     if t_years > 0 and atr and atr > 0:
@@ -273,6 +283,13 @@ async def _find_tradable_expiry_and_strike(
                     return expiry, alt_strike, alt_delta, delta_source
             except Exception:
                 continue
+
+    # Ни один контракт не подтверждён через TraderNet.
+    # По умолчанию (require_validation=False) НЕ блокируем сигнал — открываем
+    # позицию по первому расчётному варианту. Это защищает от ситуации, когда
+    # опционный эндпоинт TraderNet просто не отдаёт котировки в ожидаемом формате.
+    if not cfg.require_validation and fallback is not None:
+        return fallback
 
     return None
 

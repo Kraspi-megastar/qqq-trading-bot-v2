@@ -68,6 +68,7 @@ def _help_text() -> str:
         "/options — текущая опционная позиция\n"
         "/trades [N] — последние N закрытых сделок\n"
         "/dayreport — итоги дня по опционам\n"
+        "/optest [ticker] — диагностика котировки опциона\n"
         "/dump [N] — последние N баров\n"
         "/config — текущие настройки\n"
         "/strategy — показать текущую стратегию\n"
@@ -472,6 +473,37 @@ async def cmd_dayreport(message: Message, app: AppState) -> None:
         lines.append("Сделок за дату нет или они ещё не закрыты.")
 
     await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
+
+
+@router.message(Command("optest"))
+async def cmd_optest(message: Message, app: AppState) -> None:
+    """Диагностика: показывает сырой ответ TraderNet на запрос котировки опциона.
+    Использование: /optest +QQQ.31JUL2026.C732
+    Без аргумента — строит тикер ATM CALL на ближайшую пятницу."""
+    from .options import tradernet_option_ticker
+    from datetime import date, timedelta
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) >= 2 and parts[1].strip():
+        ticker = parts[1].strip()
+    else:
+        bars = app.cache.to_list()
+        spot = float(bars[-1].close) if bars else 500.0
+        today = date.today()
+        base = today + timedelta(days=1)
+        friday = base + timedelta(days=(4 - base.weekday()) % 7)
+        strike = round(spot)
+        ticker = tradernet_option_ticker("CALL", strike, friday)
+
+    raw = await app.tn.get_option_quote_raw(ticker)
+    parsed = await app.tn.get_option_quote(ticker)
+
+    txt = (
+        f"Тикер: {ticker}\n\n"
+        f"Распарсено: {parsed}\n\n"
+        f"Сырой ответ:\n{raw}"
+    )
+    await message.answer("<pre>" + html.escape(txt) + "</pre>")
 
 
 @router.message(F.text.startswith("/strategy"))

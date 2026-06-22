@@ -425,6 +425,7 @@ def _option_cfg(cfg: AppConfig) -> OptionConfig:
         target_delta=getattr(o, "target_delta", 0.375),
         max_expiry_tries=getattr(o, "max_expiry_tries", 4),
         risk_free_rate=getattr(o, "risk_free_rate", 0.05),
+        require_validation=getattr(o, "require_validation", False),
     )
 
 

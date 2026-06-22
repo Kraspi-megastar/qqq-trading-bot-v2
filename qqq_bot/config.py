@@ -51,6 +51,7 @@ class OptionConfig:
     target_delta: float = 0.375    # целевая дельта для выбора страйка (0.35–0.40)
     max_expiry_tries: int = 4      # сколько пятниц перебрать в поисках торгуемой экспирации
     risk_free_rate: float = 0.05   # безрисковая ставка для Black-Scholes
+    require_validation: bool = False  # True = не открывать без подтверждения TraderNet
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,7 @@ def load_config() -> AppConfig:
         target_delta=float(os.getenv("OPTION_TARGET_DELTA", "0.375")),
         max_expiry_tries=int(os.getenv("OPTION_MAX_EXPIRY_TRIES", "4")),
         risk_free_rate=float(os.getenv("OPTION_RISK_FREE_RATE", "0.05")),
+        require_validation=os.getenv("OPTION_REQUIRE_VALIDATION", "0") == "1",
     )
 
     return AppConfig(
