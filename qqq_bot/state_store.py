@@ -72,6 +72,7 @@ class BotState:
     opt_expiry: Optional[str] = None      # ISO date string
     opt_entry_underlying: Optional[float] = None
     opt_entry_date: Optional[str] = None  # ISO date string
+    pending_close: Optional[str] = None   # "BUY"/"SELL" сигнал, ждущий окна закрытия
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -160,6 +161,8 @@ def apply_state_if_same_session(
     else:
         app.option_position = None
 
+    app.pending_close = st.pending_close
+
     return True
 
 
@@ -180,4 +183,5 @@ def build_state_from_app(*, app: Any, session_id: str) -> BotState:
         opt_expiry=_date_iso(pos.expiry) if pos else None,
         opt_entry_underlying=pos.entry_underlying if pos else None,
         opt_entry_date=_date_iso(pos.entry_date) if pos else None,
+        pending_close=getattr(app, "pending_close", None),
     )

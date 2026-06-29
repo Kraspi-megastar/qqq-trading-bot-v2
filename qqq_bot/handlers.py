@@ -27,6 +27,23 @@ from .utils_time import utc_now
 
 router = Router()
 
+def _option_window_desc(app) -> str:
+    """Описание текущего окна торговли опционами для /status."""
+    try:
+        from . import market_hours as mh
+        from .scheduler import _option_cfg
+        from .utils_time import utc_now
+        ocfg = _option_cfg(app.cfg)
+        desc = mh.describe_window(utc_now(), app.cfg.display_tz, ocfg)
+        pend = app.pending_close
+        if pend:
+            desc += f" | отложенное закрытие: {pend}"
+        return desc
+    except Exception as e:
+        return f"n/a ({e})"
+
+
+
 
 def _fmt_ts_z(dt) -> str:
     if dt is None:
@@ -343,6 +360,7 @@ async def cmd_status(message: Message, app: AppState) -> None:
         f"Strategy:        #{app.strategy_id}\n"
         f"SessionID:       {getattr(app.stats, 'session_id', None) or '-'}\n"
         f"Сессия:          {'ОТКРЫТА' if getattr(app.stats, 'session_state', None) == 'OPEN' else 'ЗАКРЫТА'}\n\n"
+        f"Опц. окно:       {_option_window_desc(app)}\n"
         f"Cooldown:        {cd_txt}\n"
         f"Кеш:             {len(app.cache)} баров (мин. {min_b})\n\n"
         f"Последняя ошибка: {getattr(app.stats, 'last_error', None) or '-'}\n\n"

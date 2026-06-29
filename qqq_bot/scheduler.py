@@ -28,8 +28,9 @@ from .config import AppConfig
 from .models import Bar
 from .pipeline import bars_to_df, add_indicators, min_bars_for_indicators
 from .signals import compute_signal, SignalDecision, Strategy2State
-from .options import OptionPosition, OptionConfig, get_option_recommendation
+from .options import OptionPosition, OptionConfig, get_option_recommendation, build_close_recommendation
 from .trades import TradeJournal
+from . import market_hours as mh
 from .charting import plot_chart
 from .tradernet import TraderNetClient
 from .state_store import apply_state_if_same_session, build_state_from_app, save_state
@@ -56,6 +57,7 @@ class AppState:
     strategy_id: int = 1
     strategy2: Strategy2State = field(default_factory=Strategy2State)
     option_position: OptionPosition | None = None  # стратегия #1: открытая опционная позиция
+    pending_close: str | None = None                # "BUY"/"SELL" сигнал, ждущий окна закрытия
     trade_journal: TradeJournal | None = None       # журнал опционных сделок
 
     def set_strategy(self, strategy_id: int) -> None:
@@ -426,6 +428,10 @@ def _option_cfg(cfg: AppConfig) -> OptionConfig:
         max_expiry_tries=getattr(o, "max_expiry_tries", 4),
         risk_free_rate=getattr(o, "risk_free_rate", 0.05),
         require_validation=getattr(o, "require_validation", False),
+        max_dte=getattr(o, "max_dte", 4),
+        open_blackout_min=getattr(o, "open_blackout_min", 10),
+        close_blackout_min=getattr(o, "close_blackout_min", 15),
+        force_close_min=getattr(o, "force_close_min", 15),
     )
 
 
@@ -530,6 +536,48 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
             )
             app.last_chart_path = str(chart_path)
 
+            # 6.5) Опционные авто-действия (не зависят от сигналов QQQ):
+            #      - принудительное закрытие в конце дня (не держим ночь)
+            #      - отложенное закрытие при открытии окна RTH
+            if app.cfg.option.enabled and app.option_position is not None:
+                ocfg = _option_cfg(cfg)
+                spot_now = None
+                try:
+                    spot_now = float(df["close"].iloc[-1]) if len(df) else None
+                except Exception:
+                    spot_now = None
+
+                force = mh.should_force_close(now, cfg.display_tz, ocfg.force_close_min)
+                can_close_now = mh.can_close_option(
+                    now, cfg.display_tz, ocfg.open_blackout_min, ocfg.close_blackout_min
+                )
+
+                auto_rec = None
+                if force and spot_now is not None:
+                    # Конец дня — закрываем принудительно (приоритет над окнами)
+                    auto_rec = build_close_recommendation(
+                        app.option_position, spot_now, ocfg, reason="force_close"
+                    )
+                    app.pending_close = None
+                elif app.pending_close is not None and can_close_now and spot_now is not None:
+                    # Рынок открылся — исполняем отложенное закрытие по живой цене
+                    auto_rec = build_close_recommendation(
+                        app.option_position, spot_now, ocfg, reason="pending_close"
+                    )
+                    app.pending_close = None
+
+                if auto_rec is not None:
+                    try:
+                        await send_signal_cb(
+                            SignalDecision("SELL", f"Опцион: {auto_rec.delta_source}", {}),
+                            str(cfg.cache_dir / "chart.png"),
+                            df.iloc[:-1] if len(df) >= 2 else df,
+                            auto_rec,
+                        )
+                        app.persist_state(now)
+                    except Exception as e:
+                        app.stats.last_error = f"auto_close: {repr(e)}"
+
             # 6) Периодическое сохранение кэша и состояния
             if len(app.cache) > 0 and (rolled or (now - last_persist) >= timedelta(seconds=60)):
                 try:
@@ -556,11 +604,16 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                     sig_ts = pd.to_datetime(sig_ts, utc=True, errors="coerce").to_pydatetime()
 
                 # Определяем что произойдёт с опционом ДО отправки.
-                # Сообщение шлём только если позиция реально меняется (OPEN/CLOSE).
-                # HOLD (уже в позиции) и пропуск из-за закрытого рынка — НЕ шлём.
+                # Окна: открытие/закрытие только в RTH минус блэкауты.
                 rec = None
                 if app.cfg.option.enabled:
-                    rth_open = _is_rth_open(now, cfg.display_tz)
+                    ocfg = _option_cfg(cfg)
+                    can_open = mh.can_open_option(
+                        now, cfg.display_tz, ocfg.open_blackout_min, ocfg.close_blackout_min
+                    )
+                    can_close = mh.can_close_option(
+                        now, cfg.display_tz, ocfg.open_blackout_min, ocfg.close_blackout_min
+                    )
                     atr_v = None
                     try:
                         if len(df_sig) > 0 and "atr" in df_sig.columns:
@@ -572,15 +625,28 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                         rec = await get_option_recommendation(
                             signal=decision.action,
                             underlying_price=float(sig_price) if sig_price else float(df["close"].iloc[-1]),
-                            cfg=_option_cfg(cfg),
+                            cfg=ocfg,
                             current_position=app.option_position,
-                            market_open=rth_open,
+                            can_open=can_open,
+                            can_close=can_close,
                             atr=atr_v,
                             tn=app.tn,
                         )
                     except Exception as e:
                         app.stats.last_error = f"option_rec: {repr(e)}"
                         rec = None
+
+                    # Управление отложенным закрытием (pending_close):
+                    if rec is not None:
+                        if rec.action_type == "CLOSE" and rec.skipped_market_closed:
+                            # закрытие пришло вне окна — запоминаем, позиция остаётся
+                            app.pending_close = decision.action
+                        elif rec.action_type == "OPEN":
+                            # сигнал развернулся в открытие — отменяем отложенное закрытие
+                            app.pending_close = None
+                        elif rec.action_type == "CLOSE" and not rec.skipped_market_closed:
+                            # закрытие исполнено в окне — снимаем флаг
+                            app.pending_close = None
 
                 # Решаем, нужно ли вообще отправлять сообщение
                 should_send = True

@@ -59,19 +59,24 @@ class OptionPosition:
 @dataclass
 class OptionConfig:
     enabled: bool = True
-    min_dte: int = 1
+    min_dte: int = 0
+    max_dte: int = 4               # максимальный срок до экспирации (дней)
     strike_step: float = 1.0
     underlying_symbol: str = "QQQ.US"
     # Целевая дельта для выбора страйка
     target_delta: float = 0.375
-    # Сколько будущих пятниц перебрать в поисках торгуемой экспирации
-    max_expiry_tries: int = 4
+    # Сколько дней-кандидатов перебрать в поисках торгуемой экспирации
+    max_expiry_tries: int = 8
     # Безрисковая ставка для Black-Scholes
     risk_free_rate: float = 0.05
     # Если True — НЕ открывать позицию пока TraderNet не подтвердит существование
     # контракта. Если False (по умолчанию) — при неудачной проверке открываем
     # по расчётному тикеру (валидация не должна глушить все сигналы).
     require_validation: bool = False
+    # Временные окна (минуты), используются scheduler через market_hours
+    open_blackout_min: int = 10
+    close_blackout_min: int = 15
+    force_close_min: int = 15
 
 
 @dataclass
@@ -99,10 +104,27 @@ class OptionRecommendation:
 # Тикеры и даты
 # ────────────────────────────────────────────────────────────────────────────
 
-def _next_friday(from_date: date, min_dte: int) -> date:
-    target = from_date + timedelta(days=min_dte)
-    days_to_friday = (4 - target.weekday()) % 7
-    return target + timedelta(days=days_to_friday)
+def _candidate_expiries(today: date, min_dte: int, max_dte: int) -> list[date]:
+    """
+    Список дат-кандидатов для экспирации: каждый РАБОЧИЙ день (Пн–Пт)
+    в окне [min_dte, max_dte] от сегодня, по возрастанию срока.
+    QQQ имеет daily-опционы, поэтому перебираем все будни, а не только пятницы.
+    Проверка реального существования контракта — выше по стеку (getSecurityInfo).
+    """
+    out: list[date] = []
+    for d in range(min_dte, max_dte + 1):
+        cand = today + timedelta(days=d)
+        if cand.weekday() < 5:  # 0..4 = Пн..Пт
+            out.append(cand)
+    return out
+
+
+def _nearest_business_day(from_date: date, min_dte: int) -> date:
+    """Ближайший рабочий день не раньше from_date+min_dte (для заглушек/стабов)."""
+    cand = from_date + timedelta(days=max(min_dte, 0))
+    while cand.weekday() >= 5:
+        cand += timedelta(days=1)
+    return cand
 
 
 def _dte(expiry: date, today: date) -> int:
@@ -251,24 +273,23 @@ async def _find_tradable_expiry_and_strike(
     atr: Optional[float],
 ) -> Optional[tuple[date, float, Optional[float], str]]:
     """
-    Перебирает ближайшие пятницы, для каждой подбирает страйк по дельте
-    и проверяет что опцион реально торгуется в TraderNet.
+    Перебирает рабочие дни в окне [min_dte, max_dte], для каждого подбирает
+    страйк по дельте и проверяет что опцион реально торгуется (getSecurityInfo).
+    Берёт БЛИЖАЙШУЮ доступную экспирацию (короткий срок по стратегии).
 
     Возвращает (expiry, strike, delta, delta_source) или None если ничего не найдено.
-
-    Если tn is None — не можем проверить существование, возвращаем первый расчёт.
+    Если tn is None — не можем проверить, возвращаем первый расчёт.
     """
-    base = today + timedelta(days=cfg.min_dte)
-    days_to_friday = (4 - base.weekday()) % 7
-    first_friday = base + timedelta(days=days_to_friday)
+    candidates = _candidate_expiries(today, cfg.min_dte, cfg.max_dte)
+    if not candidates:
+        # окно пустое (например все дни выходные) — берём ближайший рабочий день
+        candidates = [_nearest_business_day(today, cfg.min_dte)]
 
-    # Запоминаем самый первый расчётный вариант — используем как fallback,
-    # если ни один страйк не удалось ПОДТВЕРДИТЬ через TraderNet.
+    # Запоминаем самый первый расчётный вариант — fallback,
+    # если ни один контракт не удалось ПОДТВЕРДИТЬ через TraderNet.
     fallback: Optional[tuple[date, float, Optional[float], str]] = None
 
-    for i in range(cfg.max_expiry_tries):
-        expiry = first_friday + timedelta(days=7 * i)
-
+    for expiry in candidates:
         strike, delta, delta_source = await _pick_strike_by_delta(
             tn=tn, cfg=cfg, option_type=option_type,
             spot=spot, expiry=expiry, today=today, atr=atr,
@@ -327,23 +348,32 @@ async def get_option_recommendation(
     underlying_price: float,
     cfg: OptionConfig,
     current_position: Optional[OptionPosition],
-    market_open: bool = True,        # основная сессия RTH открыта?
+    can_open: bool = True,           # окно открытия RTH (9:40–15:45)
+    can_close: bool = True,          # окно закрытия RTH (9:40–15:45)
     atr: Optional[float] = None,     # для оценки волатильности
     tn=None,                         # TraderNetClient для проверки/цепочки
-    session: Optional[aiohttp.ClientSession] = None,  # legacy, не используется
+    session: Optional[aiohttp.ClientSession] = None,  # legacy
     api_url: str = "",
     sid: Optional[str] = None,
 ) -> OptionRecommendation:
     """
-    Рекомендация с учётом позиции, рыночной сессии и существования контракта.
+    Рекомендация с учётом позиции, окон торговли опционами и существования контракта.
+
+    can_open  — можно ли открывать опцион сейчас (RTH минус блэкауты).
+    can_close — можно ли закрывать опцион по сигналу сейчас.
+
+    Если действие выпадает на запрещённое окно:
+      OPEN  вне окна → HOLD, позиция НЕ открывается (skipped_market_closed=True).
+      CLOSE вне окна → CLOSE с пометкой pending (skipped_market_closed=True),
+                       позиция НЕ снимается — scheduler пометит её "ожидает закрытия".
     """
     action_type, option_type = _resolve_action(signal, current_position)
     today = datetime.now(tz=timezone.utc).date()
 
     # ── CLOSE: используем параметры открытой позиции ──────────────────────
     if action_type == "CLOSE" and current_position is not None:
-        # Закрытие разрешено всегда (даже на премаркете — позицию надо уметь закрыть),
-        # но физически торговать опционами можно только в RTH. Помечаем флаг.
+        # Вне окна закрытия — не снимаем позицию, помечаем pending.
+        new_pos = current_position if not can_close else None
         return OptionRecommendation(
             action_type="CLOSE",
             option_type=option_type,
@@ -357,8 +387,8 @@ async def get_option_recommendation(
             delta_source="-",
             moneyness=_moneyness(option_type, current_position.strike, underlying_price, cfg.strike_step),
             source="position",
-            new_position=None,
-            skipped_market_closed=(not market_open),
+            new_position=new_pos,
+            skipped_market_closed=(not can_close),
         )
 
     # ── HOLD ──────────────────────────────────────────────────────────────
@@ -380,7 +410,7 @@ async def get_option_recommendation(
                 new_position=current_position,
             )
         else:
-            stub_expiry = _next_friday(today, cfg.min_dte)
+            stub_expiry = _nearest_business_day(today, cfg.min_dte)
             return OptionRecommendation(
                 action_type="HOLD", option_type="CALL",
                 ticker="-", tn_ticker="-", strike=0.0, expiry=stub_expiry,
@@ -390,9 +420,9 @@ async def get_option_recommendation(
             )
 
     # ── OPEN ────────────────────────────────────────────────────────────────
-    # Опционы открываем ТОЛЬКО в основную сессию.
-    if not market_open:
-        stub_expiry = _next_friday(today, cfg.min_dte)
+    # Опционы открываем ТОЛЬКО в разрешённое окно RTH.
+    if not can_open:
+        stub_expiry = _nearest_business_day(today, cfg.min_dte)
         return OptionRecommendation(
             action_type="HOLD",          # действие не выполнено
             option_type=option_type,
@@ -411,7 +441,7 @@ async def get_option_recommendation(
 
     if found is None:
         # Не нашли торгуемый контракт — не открываем позицию
-        stub_expiry = _next_friday(today, cfg.min_dte)
+        stub_expiry = _nearest_business_day(today, cfg.min_dte)
         return OptionRecommendation(
             action_type="HOLD", option_type=option_type,
             ticker="-", tn_ticker="-", strike=0.0, expiry=stub_expiry,
@@ -454,6 +484,38 @@ async def get_option_recommendation(
     )
 
 
+def build_close_recommendation(
+    position: OptionPosition,
+    underlying_price: float,
+    cfg: OptionConfig,
+    reason: str = "close",
+) -> OptionRecommendation:
+    """
+    Строит CLOSE-рекомендацию для существующей позиции напрямую
+    (без сигнала). Используется для:
+      - принудительного закрытия в конце дня (reason="force_close"),
+      - отложенного закрытия при открытии рынка (reason="pending_close").
+    Позиция всегда снимается (new_position=None).
+    """
+    today = datetime.now(tz=timezone.utc).date()
+    return OptionRecommendation(
+        action_type="CLOSE",
+        option_type=position.option_type,
+        ticker=position.ticker,
+        tn_ticker=position.tn_ticker,
+        strike=position.strike,
+        expiry=position.expiry,
+        dte=_dte(position.expiry, today),
+        underlying_price=underlying_price,
+        delta=None,
+        delta_source=reason,   # храним причину в delta_source для форматтера
+        moneyness=_moneyness(position.option_type, position.strike, underlying_price, cfg.strike_step),
+        source="position",
+        new_position=None,
+        skipped_market_closed=False,
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Форматирование
 # ────────────────────────────────────────────────────────────────────────────
@@ -475,9 +537,14 @@ def format_option_message(rec: OptionRecommendation) -> str:
         emoji = "📈" if rec.option_type == "CALL" else "📉"
         header = f"{emoji} <b>Опцион: ОТКРЫТЬ {rec.option_type}</b>"
     elif rec.action_type == "CLOSE":
-        header = f"🔒 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
+        if rec.delta_source == "force_close":
+            header = f"🔚 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b> (конец дня, не держим ночь)"
+        elif rec.delta_source == "pending_close":
+            header = f"🔓 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b> (отложенное закрытие, рынок открылся)"
+        else:
+            header = f"🔒 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
         if rec.skipped_market_closed:
-            header += "\n⚠️ рынок опционов закрыт — закрытие при открытии RTH"
+            header += "\n⚠️ вне окна закрытия — закроется при открытии RTH"
     else:  # HOLD
         if rec.new_position is not None:
             header = f"⏸ <b>Опцион: ДЕРЖАТЬ {rec.option_type}</b> (уже в позиции)"

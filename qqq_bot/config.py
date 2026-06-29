@@ -49,9 +49,14 @@ class OptionConfig:
     strike_step: float = 1.0       # шаг страйка ($1 для QQQ)
     underlying_symbol: str = "QQQ.US"
     target_delta: float = 0.375    # целевая дельта для выбора страйка (0.35–0.40)
-    max_expiry_tries: int = 4      # сколько пятниц перебрать в поисках торгуемой экспирации
+    max_expiry_tries: int = 8      # сколько дней перебрать в поисках торгуемой экспирации
     risk_free_rate: float = 0.05   # безрисковая ставка для Black-Scholes
     require_validation: bool = False  # True = не открывать без подтверждения TraderNet
+    max_dte: int = 4               # максимальный срок до экспирации (дней)
+    # Временные окна RTH (минуты от начала дня по ET); опционы только в основную сессию
+    open_blackout_min: int = 10    # не открывать первые N минут после 9:30
+    close_blackout_min: int = 15   # не открывать/закрывать за N минут до 16:00
+    force_close_min: int = 15      # принудительно закрывать за N минут до 16:00 (не держать ночь)
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,10 @@ def load_config() -> AppConfig:
         max_expiry_tries=int(os.getenv("OPTION_MAX_EXPIRY_TRIES", "4")),
         risk_free_rate=float(os.getenv("OPTION_RISK_FREE_RATE", "0.05")),
         require_validation=os.getenv("OPTION_REQUIRE_VALIDATION", "0") == "1",
+        max_dte=int(os.getenv("OPTION_MAX_DTE", "4")),
+        open_blackout_min=int(os.getenv("OPTION_OPEN_BLACKOUT_MIN", "10")),
+        close_blackout_min=int(os.getenv("OPTION_CLOSE_BLACKOUT_MIN", "15")),
+        force_close_min=int(os.getenv("OPTION_FORCE_CLOSE_MIN", "15")),
     )
 
     return AppConfig(
