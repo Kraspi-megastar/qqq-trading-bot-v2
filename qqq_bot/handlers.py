@@ -622,14 +622,28 @@ async def cmd_account(message: Message, app: AppState) -> None:
         await message.answer("Брокер недоступен (EXEC_ENABLED=0 или нет ключей).")
         return
     pp = app.broker.purchasing_power()
-    summ = app.broker.account_summary()
     lines = ["<b>Счёт</b>"]
     if pp is not None:
-        lines.append(f"Покупательная способность: ${pp:,.2f}")
+        lines.append(f"Свободно USD: ${pp:,.2f}")
+        # прикинем сколько контрактов при текущих настройках на опцион ~$3
+        ex = app.cfg.execution
+        budget = pp * min(ex.position_pct, ex.max_position_pct) / 100.0
+        lines.append(f"Бюджет на сделку ({ex.position_pct}%): ${budget:,.2f}")
     else:
-        lines.append("Покупательная способность: не удалось определить")
-    if isinstance(summ, dict):
-        lines.append(f"account_summary: получен ({len(summ)} ключей верхнего уровня)")
+        lines.append("Свободный остаток: не удалось определить")
+
+    try:
+        positions = app.broker.get_positions()
+        if positions:
+            lines.append("")
+            lines.append(f"<b>Позиции: {len(positions)}</b>")
+            for p in positions[:15]:
+                instr = p.get("i", "?")
+                q = p.get("q", "?")
+                mkt = p.get("mkt_price", p.get("market_value", "?"))
+                lines.append(f"  {instr} | q={q} | mkt={mkt}")
+    except Exception:
+        pass
     await message.answer("\n".join(lines))
 
 
@@ -648,6 +662,22 @@ async def cmd_orders(message: Message, app: AppState) -> None:
         instr = o.get("instr", "?")
         oper = "BUY" if o.get("oper") == 1 else "SELL" if o.get("oper") == 2 else f"op{o.get('oper')}"
         lines.append(f"{o.get('order_id')} | {instr} | {oper} | q={o.get('q')} @ {o.get('p')}")
+    await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
+
+
+@router.message(Command("positions"))
+async def cmd_positions(message: Message, app: AppState) -> None:
+    """Открытые позиции у брокера (только чтение)."""
+    if app.broker is None or not app.broker.available:
+        await message.answer("Брокер недоступен.")
+        return
+    positions = app.broker.get_positions()
+    if not positions:
+        await message.answer("Открытых позиций нет.")
+        return
+    lines = [f"<b>Позиции: {len(positions)}</b>", ""]
+    for p in positions[:20]:
+        lines.append(f"{p.get('i','?')} | q={p.get('q')} | mkt={p.get('mkt_price', p.get('market_value','?'))} | P/L={p.get('profit_close','?')}")
     await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
 
 

@@ -194,27 +194,43 @@ class Broker:
                 return o
         return None
 
-    def purchasing_power(self) -> Optional[float]:
+    def purchasing_power(self, currency: str = "USD") -> Optional[float]:
         """
-        Покупательная способность из account_summary.
-        Возвращает None если не удалось определить (тогда caller НЕ должен торговать).
+        Свободный денежный остаток в указанной валюте (по умолчанию USD).
+
+        Структура account_summary: result.ps.acc — список счетов по валютам,
+        у каждого curr (валюта) и s (сумма). Берём консервативно денежный остаток
+        (без учёта маржи) — лучше недооценить доступное, чем переоценить.
+
+        Возвращает None если не удалось определить (тогда caller НЕ должен открывать).
         """
         summ = self.account_summary()
         if not isinstance(summ, dict):
             return None
-        # структура account_summary может отличаться — ищем разумные ключи
-        # (уточним на реальных данных; пока пробуем известные варианты)
-        for path in (("result", "ps"), ("result", "purchasing_power"),
-                     ("result", "acc", 0, "s"), ("ps",), ("purchasing_power",)):
-            node: Any = summ
-            try:
-                for key in path:
-                    node = node[key]
-                val = float(node)
-                return val
-            except (KeyError, IndexError, TypeError, ValueError):
-                continue
-        return None
+        try:
+            acc = summ["result"]["ps"]["acc"]
+            if not isinstance(acc, list):
+                return None
+            for entry in acc:
+                if isinstance(entry, dict) and entry.get("curr") == currency:
+                    return float(entry.get("s", 0.0))
+            # валюта не найдена — значит 0 на этом балансе
+            return 0.0
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def get_positions(self) -> list[dict]:
+        """Открытые позиции из account_summary (result.ps.pos)."""
+        summ = self.account_summary()
+        if not isinstance(summ, dict):
+            return []
+        try:
+            pos = summ["result"]["ps"]["pos"]
+            if isinstance(pos, dict):
+                pos = [pos]
+            return pos or []
+        except (KeyError, TypeError):
+            return []
 
     # ── Предохранители перед ордером ─────────────────────────────────────────
 
