@@ -28,6 +28,10 @@ from .config import AppConfig
 from .models import Bar
 from .pipeline import bars_to_df, add_indicators, min_bars_for_indicators
 from .signals import compute_signal, SignalDecision, Strategy2State
+from .consensus import (
+    ConsensusState, ConsensusConfig, compute_consensus,
+    signal_to_vote, ml_to_vote, format_consensus, format_conflict_warning,
+)
 from .options import OptionPosition, OptionConfig, get_option_recommendation, build_close_recommendation
 from .trades import TradeJournal
 from . import market_hours as mh
@@ -59,6 +63,9 @@ class AppState:
     option_position: OptionPosition | None = None  # стратегия #1: открытая опционная позиция
     pending_close: str | None = None                # "BUY"/"SELL" сигнал, ждущий окна закрытия
     trade_journal: TradeJournal | None = None       # журнал опционных сделок
+    consensus_state: ConsensusState = field(default_factory=ConsensusState)
+    ml_service: object | None = None                 # MLTradingService | None (advisory)
+    strategy2_for_consensus: Strategy2State = field(default_factory=Strategy2State)  # #2 считается всегда
 
     def set_strategy(self, strategy_id: int) -> None:
         """
@@ -514,6 +521,65 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                     # Применяем новое состояние стратегии #2 (чистая функция)
                     _apply_new_state(app, decision)
 
+            # 3.5) КОНСЕНСУС: считаем все три источника при смене бара.
+            #      #1 и #2 считаются всегда (независимо от активной стратегии),
+            #      ML — advisory-режим (только вероятности, ничего не блокирует).
+            consensus_res = None
+            if getattr(cfg, "consensus", None) and cfg.consensus.enabled and rolled and len(df_sig) > 0:
+                try:
+                    app.consensus_state.tick()
+
+                    # #1 всегда
+                    dec1 = compute_signal(df_sig, cfg.signal, strategy_id=1)
+                    if dec1.action in ("BUY", "SELL"):
+                        app.consensus_state.set_vote(
+                            "s1", signal_to_vote(dec1.action),
+                            f"score={dec1.details.get('buy_score', dec1.details.get('sell_score', '?'))}"
+                        )
+
+                    # #2 всегда (отдельное состояние, чтобы не мешать основному)
+                    dec2 = compute_signal(
+                        df_sig, cfg.signal, strategy_id=2,
+                        state=app.strategy2_for_consensus,
+                    )
+                    if dec2.new_state is not None:
+                        app.strategy2_for_consensus = dec2.new_state
+                    if dec2.action in ("BUY", "SELL"):
+                        app.consensus_state.set_vote(
+                            "s2", signal_to_vote(dec2.action), dec2.reason[:40]
+                        )
+
+                    # ML advisory
+                    if app.ml_service is not None:
+                        try:
+                            pos_type = app.option_position.option_type if app.option_position else None
+                            ml_dec = app.ml_service.decide(
+                                bars=df_sig.rename(columns={"ts": "timestamp"}),
+                                base_signal=decision.action if decision.action in ("BUY", "SELL") else "HOLD",
+                                strategy_context={
+                                    "symbol": cfg.symbol,
+                                    "timeframe": cfg.timeframe_minutes,
+                                    "session": "regular" if _is_rth_open(now, cfg.display_tz) else "ext",
+                                    "strategy_id": app.strategy_id,
+                                    "timeframe_minutes": cfg.timeframe_minutes,
+                                },
+                                current_position=(app.option_position.option_type if app.option_position else None),
+                            )
+                            mlv, mld = ml_to_vote(
+                                getattr(ml_dec, "long_prob", 0.5),
+                                getattr(ml_dec, "short_prob", 0.5),
+                                cfg.consensus.ml_min_edge,
+                            )
+                            if mlv != 0:
+                                app.consensus_state.set_vote("ml", mlv, mld)
+                        except Exception as e:
+                            app.stats.last_error = f"ml_decide: {repr(e)}"
+
+                    consensus_res = compute_consensus(app.consensus_state, cfg.consensus)
+                except Exception as e:
+                    app.stats.last_error = f"consensus: {repr(e)}"
+                    consensus_res = None
+
             # 4) Логируем каждое решение
             try:
                 sig_close: float | None = None
@@ -553,13 +619,30 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                 )
 
                 auto_rec = None
-                if force and spot_now is not None:
+                auto_reason_text = None
+
+                # Приоритет 0: конфликт консенсуса — если ОБА других источника
+                # (#2 и ML) единогласно против позиции, закрываем досрочно.
+                if (consensus_res is not None and can_close_now and spot_now is not None
+                        and getattr(cfg, "consensus", None) and cfg.consensus.enabled):
+                    pos_type = app.option_position.option_type
+                    s2_against, ml_against = consensus_res.votes_against(pos_type)
+                    if s2_against and ml_against:
+                        auto_rec = build_close_recommendation(
+                            app.option_position, spot_now, ocfg, reason="conflict_close"
+                        )
+                        auto_reason_text = format_conflict_warning(
+                            consensus_res, pos_type, will_close=True
+                        )
+                        app.pending_close = None
+
+                if auto_rec is None and force and spot_now is not None:
                     # Конец дня — закрываем принудительно (приоритет над окнами)
                     auto_rec = build_close_recommendation(
                         app.option_position, spot_now, ocfg, reason="force_close"
                     )
                     app.pending_close = None
-                elif app.pending_close is not None and can_close_now and spot_now is not None:
+                elif auto_rec is None and app.pending_close is not None and can_close_now and spot_now is not None:
                     # Рынок открылся — исполняем отложенное закрытие по живой цене
                     auto_rec = build_close_recommendation(
                         app.option_position, spot_now, ocfg, reason="pending_close"
@@ -573,6 +656,7 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             str(cfg.cache_dir / "chart.png"),
                             df.iloc[:-1] if len(df) >= 2 else df,
                             auto_rec,
+                            auto_reason_text,   # extra_text: предупреждение о конфликте
                         )
                         app.persist_state(now)
                     except Exception as e:
@@ -702,8 +786,11 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             signal_chart_path = chart_path
 
                         try:
-                            # Передаём готовую рекомендацию в callback
-                            await send_signal_cb(decision, str(signal_chart_path), df_sig, rec)
+                            # Консенсус-разбивка при сигнале #1 (или активной стратегии)
+                            consensus_text = None
+                            if consensus_res is not None:
+                                consensus_text = format_consensus(consensus_res)
+                            await send_signal_cb(decision, str(signal_chart_path), df_sig, rec, consensus_text)
                             try:
                                 app.persist_state(now)
                             except Exception as e:

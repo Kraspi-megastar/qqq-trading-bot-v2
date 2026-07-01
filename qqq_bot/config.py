@@ -60,6 +60,18 @@ class OptionConfig:
 
 
 @dataclass(frozen=True)
+class ConsensusConfig:
+    """Настройки ансамбля трёх источников (#1, #2, ML)."""
+    enabled: bool = True
+    agree_window_bars: int = 12
+    weight_s1: float = 1.0
+    weight_s2: float = 1.0
+    weight_ml: float = 1.0
+    ml_min_edge: float = 0.05
+    conflict_score_threshold: float = 1.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     telegram_bot_token: str
     telegram_channel_id: int
@@ -80,6 +92,7 @@ class AppConfig:
     display_tz: str
     signal: SignalConfig
     option: OptionConfig
+    consensus: ConsensusConfig
 
     cooldown_seconds: int
     strategy_id: int
@@ -160,6 +173,15 @@ def load_config() -> AppConfig:
         display_tz=os.getenv("DISPLAY_TZ", "America/New_York"),
         signal=signal,
         option=option,
+        consensus=ConsensusConfig(
+            enabled=os.getenv("CONSENSUS_ENABLED", "1") == "1",
+            agree_window_bars=int(os.getenv("CONSENSUS_WINDOW_BARS", "12")),
+            weight_s1=float(os.getenv("CONSENSUS_WEIGHT_S1", "1.0")),
+            weight_s2=float(os.getenv("CONSENSUS_WEIGHT_S2", "1.0")),
+            weight_ml=float(os.getenv("CONSENSUS_WEIGHT_ML", "1.0")),
+            ml_min_edge=float(os.getenv("CONSENSUS_ML_MIN_EDGE", "0.05")),
+            conflict_score_threshold=float(os.getenv("CONSENSUS_CONFLICT_THRESHOLD", "1.0")),
+        ),
         cooldown_seconds=int(os.getenv("COOLDOWN_SECONDS", "300")),
         strategy_id=int(os.getenv("STRATEGY_ID", "1")),
     )

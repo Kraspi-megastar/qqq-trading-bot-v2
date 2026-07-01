@@ -58,6 +58,7 @@ async def _send_signal_to_channel(
     df_sig,
     rec: OptionRecommendation | None,
     session: aiohttp.ClientSession,
+    extra_text: str | None = None,
 ) -> None:
     import pandas as pd
 
@@ -137,6 +138,9 @@ async def _send_signal_to_channel(
 
         lines += ["", format_option_message(rec)]
 
+    if extra_text:
+        lines += ["", extra_text]
+
     caption = "\n".join(lines)
     await bot.send_photo(
         chat_id=app.cfg.telegram_channel_id,
@@ -168,12 +172,28 @@ async def _amain() -> None:
         app.strategy_id = cfg.strategy_id
         app.trade_journal = TradeJournal(cfg.cache_dir)
 
+        # ML-сервис для консенсуса (advisory-режим: только вероятности, ничего не блокирует).
+        # Изолировано: если модель не грузится — консенсус работает на #1 + #2.
+        if cfg.consensus.enabled:
+            try:
+                from .ml.service import MLTradingService
+                import os as _os
+                _os.environ.setdefault("ML_ENABLED", "1")
+                _os.environ.setdefault("ML_MODE", "advisory")
+                app.ml_service = MLTradingService.from_env()
+                if getattr(app.ml_service, "predictor", None) is None:
+                    app.stats.last_error = f"ML не загружен: {getattr(app.ml_service, 'load_error', 'n/a')}"
+                    app.ml_service = None
+            except Exception as e:
+                app.stats.last_error = f"ML init: {repr(e)}"
+                app.ml_service = None
+
         dp["app"] = app
 
         asyncio.create_task(bootstrap_history(app))
 
-        async def sender(decision: SignalDecision, chart_path: str, df_sig, rec=None) -> None:
-            await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, rec, session)
+        async def sender(decision: SignalDecision, chart_path: str, df_sig, rec=None, extra_text=None) -> None:
+            await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, rec, session, extra_text)
 
         asyncio.create_task(polling_loop(app, sender))
 

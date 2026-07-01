@@ -541,6 +541,8 @@ def format_option_message(rec: OptionRecommendation) -> str:
             header = f"🔚 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b> (конец дня, не держим ночь)"
         elif rec.delta_source == "pending_close":
             header = f"🔓 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b> (отложенное закрытие, рынок открылся)"
+        elif rec.delta_source == "conflict_close":
+            header = f"🔻 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b> (конфликт консенсуса, досрочно)"
         else:
             header = f"🔒 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
         if rec.skipped_market_closed:

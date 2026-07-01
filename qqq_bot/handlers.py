@@ -86,6 +86,7 @@ def _help_text() -> str:
         "/trades [N] — последние N закрытых сделок\n"
         "/dayreport — итоги дня по опционам\n"
         "/optest [ticker] — диагностика котировки опциона\n"
+        "/consensus — текущий консенсус трёх источников\n"
         "/dump [N] — последние N баров\n"
         "/config — текущие настройки\n"
         "/strategy — показать текущую стратегию\n"
@@ -526,6 +527,24 @@ async def cmd_optest(message: Message, app: AppState) -> None:
         f"Сырой ответ:\n{raw}"
     )
     await message.answer("<pre>" + html.escape(txt) + "</pre>")
+
+
+@router.message(Command("consensus"))
+async def cmd_consensus(message: Message, app: AppState) -> None:
+    """Показывает текущий консенсус трёх источников."""
+    if not getattr(app.cfg, "consensus", None) or not app.cfg.consensus.enabled:
+        await message.answer("Консенсус выключен (CONSENSUS_ENABLED=0).")
+        return
+    try:
+        from .consensus import compute_consensus, format_consensus
+        res = compute_consensus(app.consensus_state, app.cfg.consensus)
+        txt = format_consensus(res)
+        ml_status = "загружен" if app.ml_service is not None else "не загружен (#1+#2)"
+        txt += f"\n\nML: {ml_status}"
+        txt += f"\nОкно согласия: {app.cfg.consensus.agree_window_bars} баров"
+        await message.answer(txt)
+    except Exception as e:
+        await message.answer(f"Ошибка консенсуса: {html.escape(str(e))}")
 
 
 @router.message(F.text.startswith("/strategy"))
