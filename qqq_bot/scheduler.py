@@ -66,6 +66,7 @@ class AppState:
     consensus_state: ConsensusState = field(default_factory=ConsensusState)
     ml_service: object | None = None                 # MLTradingService | None (advisory)
     strategy2_for_consensus: Strategy2State = field(default_factory=Strategy2State)  # #2 считается всегда
+    broker: object | None = None                     # Broker | None (боевое исполнение)
 
     def set_strategy(self, strategy_id: int) -> None:
         """
@@ -805,5 +806,12 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
         except Exception as e:
             app.stats.last_error = repr(e)
             logger.exception("polling_loop iteration error")
+
+        # Чистим протухшие ожидания подтверждения (semi-auto тайм-аут)
+        if app.broker is not None:
+            try:
+                app.broker.purge_expired_pending()
+            except Exception:
+                pass
 
         await asyncio.sleep(cfg.poll_seconds)

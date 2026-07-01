@@ -141,12 +141,48 @@ async def _send_signal_to_channel(
     if extra_text:
         lines += ["", extra_text]
 
+    # ── Боевое исполнение (semi-auto): предложить ордер с кнопкой ─────────────
+    exec_keyboard = None
+    if (app.broker is not None and app.broker.available
+            and rec is not None and rec.action_type in ("OPEN", "CLOSE")
+            and app.cfg.execution.mode == "semi_auto"):
+        try:
+            price = await _fetch_option_price(app.tn, rec.tn_ticker)
+            if price and price > 0:
+                if rec.action_type == "OPEN":
+                    summ = app.broker.account_summary()
+                    acct_val = app.broker.purchasing_power() or 0.0
+                    contracts = app.broker.calc_contracts(price, acct_val)
+                    side = "BUY"
+                else:  # CLOSE
+                    # закрываем столько, сколько в позиции (по журналу — 1 по умолчанию)
+                    contracts = 1
+                    side = "SELL" if rec.option_type == "CALL" else "BUY"
+
+                if contracts >= 1:
+                    # прогоняем предохранители через preflight (не отправляя)
+                    from .broker import PendingOrder  # noqa
+                    po = app.broker.create_pending(
+                        tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
+                        limit_price=price, dte=rec.dte, is_open=(rec.action_type == "OPEN"),
+                    )
+                    from .handlers import build_confirm_keyboard
+                    exec_keyboard = build_confirm_keyboard(po.token)
+                    lines += ["", f"🎯 <b>Исполнение (semi-auto)</b>",
+                              f"{po.human}",
+                              f"⏳ подтверди в течение {app.cfg.execution.confirm_timeout_sec // 60} мин"]
+                else:
+                    lines += ["", "🎯 Исполнение: размер позиции = 0 контрактов (проверь % и баланс)"]
+        except Exception as e:
+            lines += ["", html.escape(f"[Исполнение: ошибка подготовки — {e}]")]
+
     caption = "\n".join(lines)
     await bot.send_photo(
         chat_id=app.cfg.telegram_channel_id,
         photo=FSInputFile(chart_path),
         caption=caption,
         parse_mode=ParseMode.HTML,
+        reply_markup=exec_keyboard,
     )
 
 
@@ -187,6 +223,30 @@ async def _amain() -> None:
             except Exception as e:
                 app.stats.last_error = f"ML init: {repr(e)}"
                 app.ml_service = None
+
+        # Брокер для боевого исполнения (по умолчанию выключен, EXEC_ENABLED=0).
+        # Изолировано: ошибка инициализации не влияет на сигнальную работу.
+        try:
+            from .broker import Broker, ExecutionConfig as _EC
+            ex = cfg.execution
+            bcfg = _EC(
+                enabled=ex.enabled, mode=ex.mode,
+                public_key=ex.public_key, private_key=ex.private_key,
+                position_pct=ex.position_pct, max_position_pct=ex.max_position_pct,
+                max_contracts=ex.max_contracts, max_orders_per_day=ex.max_orders_per_day,
+                max_notional_per_trade=ex.max_notional_per_trade,
+                hold_overnight_min_dte=ex.hold_overnight_min_dte,
+                block_new_position_if_dte_lte=ex.block_new_position_if_dte_lte,
+                require_reconcile=ex.require_reconcile,
+                confirm_timeout_sec=ex.confirm_timeout_sec,
+                underlying_symbol=ex.underlying_symbol,
+            )
+            app.broker = Broker(bcfg)
+            if ex.enabled and app.broker.load_error:
+                app.stats.last_error = f"Broker load: {app.broker.load_error}"
+        except Exception as e:
+            app.stats.last_error = f"Broker init: {repr(e)}"
+            app.broker = None
 
         dp["app"] = app
 

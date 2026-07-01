@@ -18,6 +18,7 @@ from typing import Any
 import pandas as pd
 from aiogram import Router, F
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.types import Message, FSInputFile
 
 from .scheduler import AppState
@@ -87,6 +88,12 @@ def _help_text() -> str:
         "/dayreport — итоги дня по опционам\n"
         "/optest [ticker] — диагностика котировки опциона\n"
         "/consensus — текущий консенсус трёх источников\n"
+        "\n<b>Исполнение (боевое):</b>\n"
+        "/exec_status — статус исполнения\n"
+        "/account — сводка по счёту\n"
+        "/orders — активные ордера\n"
+        "/halt — стоп-кран (блокировать)\n"
+        "/resume — снять стоп-кран\n"
         "/dump [N] — последние N баров\n"
         "/config — текущие настройки\n"
         "/strategy — показать текущую стратегию\n"
@@ -527,6 +534,141 @@ async def cmd_optest(message: Message, app: AppState) -> None:
         f"Сырой ответ:\n{raw}"
     )
     await message.answer("<pre>" + html.escape(txt) + "</pre>")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# БОЕВОЕ ИСПОЛНЕНИЕ — команды и подтверждение через кнопки
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Кнопки подтверждения ордера."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Исполнить", callback_data=f"exec_ok:{token}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"exec_no:{token}"),
+    ]])
+
+
+@router.callback_query(F.data.startswith("exec_ok:"))
+async def cb_exec_confirm(cq: CallbackQuery, app: AppState) -> None:
+    """Пользователь подтвердил ордер."""
+    token = cq.data.split(":", 1)[1]
+    if app.broker is None:
+        await cq.answer("Исполнение недоступно", show_alert=True)
+        return
+    po = app.broker.get_pending(token)
+    if po is None:
+        await cq.answer("Ордер не найден или истёк", show_alert=True)
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    # Исполняем
+    res = app.broker.confirm_pending(token)
+    if res.ok:
+        txt = f"✅ <b>Ордер исполнен</b>\n{res.reason}"
+        if res.order_id:
+            txt += f"\norder_id: {res.order_id}"
+        await cq.answer("Исполнено")
+    else:
+        txt = f"⚠️ <b>Не исполнено</b>\n{res.reason}"
+        await cq.answer("Ошибка", show_alert=True)
+    try:
+        await cq.message.edit_text(cq.message.html_text + f"\n\n{txt}", parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(txt)
+
+
+@router.callback_query(F.data.startswith("exec_no:"))
+async def cb_exec_reject(cq: CallbackQuery, app: AppState) -> None:
+    """Пользователь отклонил ордер."""
+    token = cq.data.split(":", 1)[1]
+    if app.broker is not None:
+        app.broker.reject_pending(token)
+    await cq.answer("Отклонено")
+    try:
+        await cq.message.edit_text(cq.message.html_text + "\n\n❌ <b>Отклонено пользователем</b>", parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.message(Command("exec_status"))
+async def cmd_exec_status(message: Message, app: AppState) -> None:
+    """Статус боевого исполнения."""
+    ex = app.cfg.execution
+    lines = ["<b>Боевое исполнение</b>"]
+    lines.append(f"Включено (EXEC_ENABLED): {'да' if ex.enabled else 'нет'}")
+    lines.append(f"Режим: {ex.mode}")
+    if app.broker is not None:
+        lines.append(f"Клиент: {'загружен' if app.broker.available else 'недоступен'}")
+        lines.append(f"Стоп-кран (halt): {'ВКЛЮЧЕН ⛔' if app.broker.halted else 'выкл'}")
+        if app.broker.load_error:
+            lines.append(f"Ошибка загрузки: {html.escape(str(app.broker.load_error))}")
+    else:
+        lines.append("Брокер не инициализирован")
+    lines.append("")
+    lines.append(f"Размер позиции: {ex.position_pct}% (потолок {ex.max_position_pct}%)")
+    lines.append(f"Макс. контрактов: {ex.max_contracts}")
+    lines.append(f"Макс. ордеров/день: {ex.max_orders_per_day}")
+    lines.append(f"Держать ночь при DTE ≥: {ex.hold_overnight_min_dte} (99=не держать)")
+    lines.append(f"0DTE-защита: не открывать при DTE ≤ {ex.block_new_position_if_dte_lte}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("account"))
+async def cmd_account(message: Message, app: AppState) -> None:
+    """Сводка по счёту (только чтение)."""
+    if app.broker is None or not app.broker.available:
+        await message.answer("Брокер недоступен (EXEC_ENABLED=0 или нет ключей).")
+        return
+    pp = app.broker.purchasing_power()
+    summ = app.broker.account_summary()
+    lines = ["<b>Счёт</b>"]
+    if pp is not None:
+        lines.append(f"Покупательная способность: ${pp:,.2f}")
+    else:
+        lines.append("Покупательная способность: не удалось определить")
+    if isinstance(summ, dict):
+        lines.append(f"account_summary: получен ({len(summ)} ключей верхнего уровня)")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("orders"))
+async def cmd_orders(message: Message, app: AppState) -> None:
+    """Активные ордера у брокера (stat==10)."""
+    if app.broker is None or not app.broker.available:
+        await message.answer("Брокер недоступен.")
+        return
+    orders = app.broker.get_active_orders()
+    if not orders:
+        await message.answer("Активных ордеров нет.")
+        return
+    lines = [f"<b>Активные ордера: {len(orders)}</b>", ""]
+    for o in orders[:20]:
+        instr = o.get("instr", "?")
+        oper = "BUY" if o.get("oper") == 1 else "SELL" if o.get("oper") == 2 else f"op{o.get('oper')}"
+        lines.append(f"{o.get('order_id')} | {instr} | {oper} | q={o.get('q')} @ {o.get('p')}")
+    await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
+
+
+@router.message(Command("halt"))
+async def cmd_halt(message: Message, app: AppState) -> None:
+    """Стоп-кран: мгновенно блокирует любое исполнение."""
+    if app.broker is None:
+        await message.answer("Брокер не инициализирован.")
+        return
+    app.broker.halt()
+    await message.answer("⛔ <b>СТОП-КРАН ВКЛЮЧЕН</b>\nЛюбое исполнение заблокировано. /resume для снятия.")
+
+
+@router.message(Command("resume"))
+async def cmd_resume(message: Message, app: AppState) -> None:
+    """Снятие стоп-крана."""
+    if app.broker is None:
+        await message.answer("Брокер не инициализирован.")
+        return
+    app.broker.resume()
+    await message.answer("✅ Стоп-кран снят. Исполнение снова возможно (в рамках EXEC_ENABLED/режима).")
 
 
 @router.message(Command("consensus"))

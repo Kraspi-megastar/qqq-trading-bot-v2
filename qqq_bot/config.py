@@ -72,6 +72,25 @@ class ConsensusConfig:
 
 
 @dataclass(frozen=True)
+class ExecutionConfig:
+    """Настройки боевого исполнения сделок. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО."""
+    enabled: bool = False
+    mode: str = "semi_auto"        # semi_auto | auto | off
+    public_key: str = ""
+    private_key: str = ""
+    position_pct: float = 5.0
+    max_position_pct: float = 10.0
+    max_contracts: int = 50
+    max_orders_per_day: int = 20
+    max_notional_per_trade: float = 50000.0
+    hold_overnight_min_dte: int = 99      # 99 = не держать ночь никогда
+    block_new_position_if_dte_lte: int = 0
+    require_reconcile: bool = True
+    confirm_timeout_sec: int = 300
+    underlying_symbol: str = "QQQ.US"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     telegram_bot_token: str
     telegram_channel_id: int
@@ -93,6 +112,7 @@ class AppConfig:
     signal: SignalConfig
     option: OptionConfig
     consensus: ConsensusConfig
+    execution: ExecutionConfig
 
     cooldown_seconds: int
     strategy_id: int
@@ -173,6 +193,22 @@ def load_config() -> AppConfig:
         display_tz=os.getenv("DISPLAY_TZ", "America/New_York"),
         signal=signal,
         option=option,
+        execution=ExecutionConfig(
+            enabled=os.getenv("EXEC_ENABLED", "0") == "1",
+            mode=os.getenv("EXEC_MODE", "semi_auto"),
+            public_key=os.getenv("TRADERNET_PUBLIC_KEY", ""),
+            private_key=os.getenv("TRADERNET_PRIVATE_KEY", ""),
+            position_pct=float(os.getenv("EXEC_POSITION_PCT", "5.0")),
+            max_position_pct=float(os.getenv("EXEC_MAX_POSITION_PCT", "10.0")),
+            max_contracts=int(os.getenv("EXEC_MAX_CONTRACTS", "50")),
+            max_orders_per_day=int(os.getenv("EXEC_MAX_ORDERS_PER_DAY", "20")),
+            max_notional_per_trade=float(os.getenv("EXEC_MAX_NOTIONAL", "50000")),
+            hold_overnight_min_dte=int(os.getenv("EXEC_HOLD_OVERNIGHT_MIN_DTE", "99")),
+            block_new_position_if_dte_lte=int(os.getenv("EXEC_BLOCK_NEW_IF_DTE_LTE", "0")),
+            require_reconcile=os.getenv("EXEC_REQUIRE_RECONCILE", "1") == "1",
+            confirm_timeout_sec=int(os.getenv("EXEC_CONFIRM_TIMEOUT_SEC", "300")),
+            underlying_symbol=os.getenv("SYMBOL", "QQQ.US"),
+        ),
         consensus=ConsensusConfig(
             enabled=os.getenv("CONSENSUS_ENABLED", "1") == "1",
             agree_window_bars=int(os.getenv("CONSENSUS_WINDOW_BARS", "12")),
