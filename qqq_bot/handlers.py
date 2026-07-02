@@ -540,38 +540,53 @@ async def cmd_optest(message: Message, app: AppState) -> None:
 # БОЕВОЕ ИСПОЛНЕНИЕ — команды и подтверждение через кнопки
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
-    """Кнопки подтверждения ордера."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Исполнить", callback_data=f"exec_ok:{token}"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data=f"exec_no:{token}"),
-    ]])
+def build_account_confirm_row(account_id: str, label: str, token: str) -> list:
+    """Ряд кнопок подтверждения для конкретного счёта."""
+    return [[
+        InlineKeyboardButton(text=f"✅ {label}", callback_data=f"exec_ok:{account_id}:{token}"),
+        InlineKeyboardButton(text=f"❌ {label}", callback_data=f"exec_no:{account_id}:{token}"),
+    ]]
+
+
+def build_confirm_keyboard(token: str, account_id: str = "ffa", label: str = "FFA") -> InlineKeyboardMarkup:
+    """Совместимость: клавиатура на один счёт."""
+    return InlineKeyboardMarkup(inline_keyboard=build_account_confirm_row(account_id, label, token))
+
+
+def _find_broker(app: AppState, account_id: str):
+    """Находит Broker по account_id."""
+    for b in getattr(app, "brokers", []) or []:
+        if getattr(b.cfg, "account_id", None) == account_id:
+            return b
+    return None
 
 
 @router.callback_query(F.data.startswith("exec_ok:"))
 async def cb_exec_confirm(cq: CallbackQuery, app: AppState) -> None:
-    """Пользователь подтвердил ордер."""
-    token = cq.data.split(":", 1)[1]
-    if app.broker is None:
-        await cq.answer("Исполнение недоступно", show_alert=True)
+    """Пользователь подтвердил ордер на конкретном счёте."""
+    parts = cq.data.split(":")
+    # формат: exec_ok:{account_id}:{token}
+    if len(parts) >= 3:
+        account_id, token = parts[1], parts[2]
+    else:
+        account_id, token = "ffa", parts[1]  # старый формат
+
+    broker = _find_broker(app, account_id)
+    if broker is None:
+        await cq.answer("Счёт не найден", show_alert=True)
         return
-    po = app.broker.get_pending(token)
+    po = broker.get_pending(token)
     if po is None:
         await cq.answer("Ордер не найден или истёк", show_alert=True)
-        try:
-            await cq.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
         return
-    # Исполняем
-    res = app.broker.confirm_pending(token)
+    res = broker.confirm_pending(token)
     if res.ok:
-        txt = f"✅ <b>Ордер исполнен</b>\n{res.reason}"
+        txt = f"✅ <b>[{broker.cfg.label}] Ордер исполнен</b>\n{res.reason}"
         if res.order_id:
             txt += f"\norder_id: {res.order_id}"
-        await cq.answer("Исполнено")
+        await cq.answer(f"{broker.cfg.label}: исполнено")
     else:
-        txt = f"⚠️ <b>Не исполнено</b>\n{res.reason}"
+        txt = f"⚠️ <b>[{broker.cfg.label}] Не исполнено</b>\n{res.reason}"
         await cq.answer("Ошибка", show_alert=True)
     try:
         await cq.message.edit_text(cq.message.html_text + f"\n\n{txt}", parse_mode="HTML")
@@ -581,124 +596,149 @@ async def cb_exec_confirm(cq: CallbackQuery, app: AppState) -> None:
 
 @router.callback_query(F.data.startswith("exec_no:"))
 async def cb_exec_reject(cq: CallbackQuery, app: AppState) -> None:
-    """Пользователь отклонил ордер."""
-    token = cq.data.split(":", 1)[1]
-    if app.broker is not None:
-        app.broker.reject_pending(token)
-    await cq.answer("Отклонено")
+    """Пользователь отклонил ордер на конкретном счёте."""
+    parts = cq.data.split(":")
+    if len(parts) >= 3:
+        account_id, token = parts[1], parts[2]
+    else:
+        account_id, token = "ffa", parts[1]
+    broker = _find_broker(app, account_id)
+    if broker is not None:
+        broker.reject_pending(token)
+    label = broker.cfg.label if broker else account_id
+    await cq.answer(f"{label}: отклонено")
     try:
-        await cq.message.edit_text(cq.message.html_text + "\n\n❌ <b>Отклонено пользователем</b>", parse_mode="HTML")
+        await cq.message.edit_text(
+            cq.message.html_text + f"\n\n❌ <b>[{label}] Отклонено</b>", parse_mode="HTML")
     except Exception:
         pass
 
 
 @router.message(Command("exec_status"))
 async def cmd_exec_status(message: Message, app: AppState) -> None:
-    """Статус боевого исполнения."""
-    ex = app.cfg.execution
+    """Статус боевого исполнения по всем счетам."""
+    brokers = getattr(app, "brokers", []) or []
+    if not brokers:
+        await message.answer("Брокеры не инициализированы (EXEC_ACCOUNTS/ключи не заданы).")
+        return
     lines = ["<b>Боевое исполнение</b>"]
-    lines.append(f"Включено (EXEC_ENABLED): {'да' if ex.enabled else 'нет'}")
-    lines.append(f"Режим: {ex.mode}")
-    if app.broker is not None:
-        lines.append(f"Клиент: {'загружен' if app.broker.available else 'недоступен'}")
-        lines.append(f"Стоп-кран (halt): {'ВКЛЮЧЕН ⛔' if app.broker.halted else 'выкл'}")
-        if app.broker.load_error:
-            lines.append(f"Ошибка загрузки: {html.escape(str(app.broker.load_error))}")
-    else:
-        lines.append("Брокер не инициализирован")
-    lines.append("")
-    lines.append(f"Размер позиции: {ex.position_pct}% (потолок {ex.max_position_pct}%)")
-    lines.append(f"Макс. контрактов: {ex.max_contracts}")
-    lines.append(f"Макс. ордеров/день: {ex.max_orders_per_day}")
-    lines.append(f"Держать ночь при DTE ≥: {ex.hold_overnight_min_dte} (99=не держать)")
-    lines.append(f"0DTE-защита: не открывать при DTE ≤ {ex.block_new_position_if_dte_lte}")
+    for b in brokers:
+        ex = b.cfg
+        lines.append("")
+        lines.append(f"<b>[{ex.label}]</b> ({ex.account_id})")
+        lines.append(f"  Включено: {'да' if ex.enabled else 'нет'} | режим: {ex.mode}")
+        lines.append(f"  Клиент: {'загружен' if b.available else 'недоступен'}"
+                     + (" | ⛔ HALT" if b.halted else ""))
+        if b.load_error:
+            lines.append(f"  Ошибка: {html.escape(str(b.load_error))}")
+        lines.append(f"  Размер: {ex.position_pct}% (потолок {ex.max_position_pct}%), "
+                     f"макс {ex.max_contracts} контр.")
+        lines.append(f"  Ночь при DTE≥{ex.hold_overnight_min_dte}, 0DTE-блок ≤{ex.block_new_position_if_dte_lte}")
     await message.answer("\n".join(lines))
 
 
 @router.message(Command("account"))
 async def cmd_account(message: Message, app: AppState) -> None:
-    """Сводка по счёту (только чтение)."""
-    if app.broker is None or not app.broker.available:
-        await message.answer("Брокер недоступен (EXEC_ENABLED=0 или нет ключей).")
+    """Сводка по всем счетам (только чтение)."""
+    brokers = getattr(app, "brokers", []) or []
+    avail = [b for b in brokers if b.available]
+    if not avail:
+        await message.answer("Нет доступных брокеров (EXEC_ENABLED=0 или нет ключей).")
         return
-    pp = app.broker.purchasing_power()
-    lines = ["<b>Счёт</b>"]
-    if pp is not None:
-        lines.append(f"Свободно USD: ${pp:,.2f}")
-        # прикинем сколько контрактов при текущих настройках на опцион ~$3
-        ex = app.cfg.execution
-        budget = pp * min(ex.position_pct, ex.max_position_pct) / 100.0
-        lines.append(f"Бюджет на сделку ({ex.position_pct}%): ${budget:,.2f}")
-    else:
-        lines.append("Свободный остаток: не удалось определить")
-
-    try:
-        positions = app.broker.get_positions()
-        if positions:
-            lines.append("")
-            lines.append(f"<b>Позиции: {len(positions)}</b>")
-            for p in positions[:15]:
-                instr = p.get("i", "?")
-                q = p.get("q", "?")
-                mkt = p.get("mkt_price", p.get("market_value", "?"))
-                lines.append(f"  {instr} | q={q} | mkt={mkt}")
-    except Exception:
-        pass
+    lines = ["<b>Счета</b>"]
+    for b in avail:
+        ex = b.cfg
+        lines.append("")
+        lines.append(f"<b>[{ex.label}]</b>")
+        pp = b.purchasing_power()
+        if pp is not None:
+            budget = pp * min(ex.position_pct, ex.max_position_pct) / 100.0
+            lines.append(f"  Свободно USD: ${pp:,.2f}")
+            lines.append(f"  Бюджет на сделку ({ex.position_pct}%): ${budget:,.2f}")
+        else:
+            lines.append("  Свободный остаток: не удалось определить")
+        try:
+            positions = b.get_positions()
+            if positions:
+                lines.append(f"  Позиции: {len(positions)}")
+                for p in positions[:10]:
+                    lines.append(f"    {p.get('i','?')} | q={p.get('q')} | mkt={p.get('mkt_price', p.get('market_value','?'))}")
+        except Exception:
+            pass
     await message.answer("\n".join(lines))
 
 
 @router.message(Command("orders"))
 async def cmd_orders(message: Message, app: AppState) -> None:
-    """Активные ордера у брокера (stat==10)."""
-    if app.broker is None or not app.broker.available:
-        await message.answer("Брокер недоступен.")
+    """Активные ордера по всем счетам (stat==10)."""
+    brokers = [b for b in (getattr(app, "brokers", []) or []) if b.available]
+    if not brokers:
+        await message.answer("Нет доступных брокеров.")
         return
-    orders = app.broker.get_active_orders()
-    if not orders:
-        await message.answer("Активных ордеров нет.")
-        return
-    lines = [f"<b>Активные ордера: {len(orders)}</b>", ""]
-    for o in orders[:20]:
-        instr = o.get("instr", "?")
-        oper = "BUY" if o.get("oper") == 1 else "SELL" if o.get("oper") == 2 else f"op{o.get('oper')}"
-        lines.append(f"{o.get('order_id')} | {instr} | {oper} | q={o.get('q')} @ {o.get('p')}")
+    lines = []
+    for b in brokers:
+        orders = b.get_active_orders()
+        lines.append(f"<b>[{b.cfg.label}]</b> активных: {len(orders)}")
+        for o in orders[:15]:
+            oper = "BUY" if o.get("oper") == 1 else "SELL" if o.get("oper") == 2 else f"op{o.get('oper')}"
+            lines.append(f"  {o.get('order_id')} | {o.get('instr','?')} | {oper} | q={o.get('q')} @ {o.get('p')}")
     await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
 
 
 @router.message(Command("positions"))
 async def cmd_positions(message: Message, app: AppState) -> None:
-    """Открытые позиции у брокера (только чтение)."""
-    if app.broker is None or not app.broker.available:
-        await message.answer("Брокер недоступен.")
+    """Открытые позиции по всем счетам (только чтение)."""
+    brokers = [b for b in (getattr(app, "brokers", []) or []) if b.available]
+    if not brokers:
+        await message.answer("Нет доступных брокеров.")
         return
-    positions = app.broker.get_positions()
-    if not positions:
-        await message.answer("Открытых позиций нет.")
-        return
-    lines = [f"<b>Позиции: {len(positions)}</b>", ""]
-    for p in positions[:20]:
-        lines.append(f"{p.get('i','?')} | q={p.get('q')} | mkt={p.get('mkt_price', p.get('market_value','?'))} | P/L={p.get('profit_close','?')}")
+    lines = []
+    for b in brokers:
+        positions = b.get_positions()
+        lines.append(f"<b>[{b.cfg.label}]</b> позиций: {len(positions)}")
+        for p in positions[:15]:
+            lines.append(f"  {p.get('i','?')} | q={p.get('q')} | mkt={p.get('mkt_price', p.get('market_value','?'))} | P/L={p.get('profit_close','?')}")
     await message.answer("<pre>" + html.escape("\n".join(lines)) + "</pre>")
 
 
 @router.message(Command("halt"))
 async def cmd_halt(message: Message, app: AppState) -> None:
-    """Стоп-кран: мгновенно блокирует любое исполнение."""
-    if app.broker is None:
-        await message.answer("Брокер не инициализирован.")
+    """Стоп-кран. /halt — все счета; /halt tfos — конкретный счёт."""
+    brokers = getattr(app, "brokers", []) or []
+    if not brokers:
+        await message.answer("Брокеры не инициализированы.")
         return
-    app.broker.halt()
-    await message.answer("⛔ <b>СТОП-КРАН ВКЛЮЧЕН</b>\nЛюбое исполнение заблокировано. /resume для снятия.")
+    arg = (message.text or "").split(maxsplit=1)
+    target = arg[1].strip().lower() if len(arg) > 1 else None
+    halted = []
+    for b in brokers:
+        if target is None or b.cfg.account_id == target:
+            b.halt()
+            halted.append(b.cfg.label)
+    if halted:
+        await message.answer(f"⛔ <b>СТОП-КРАН</b> для: {', '.join(halted)}\nИсполнение заблокировано. /resume для снятия.")
+    else:
+        await message.answer(f"Счёт '{target}' не найден.")
 
 
 @router.message(Command("resume"))
 async def cmd_resume(message: Message, app: AppState) -> None:
-    """Снятие стоп-крана."""
-    if app.broker is None:
-        await message.answer("Брокер не инициализирован.")
+    """Снятие стоп-крана. /resume — все; /resume tfos — конкретный."""
+    brokers = getattr(app, "brokers", []) or []
+    if not brokers:
+        await message.answer("Брокеры не инициализированы.")
         return
-    app.broker.resume()
-    await message.answer("✅ Стоп-кран снят. Исполнение снова возможно (в рамках EXEC_ENABLED/режима).")
+    arg = (message.text or "").split(maxsplit=1)
+    target = arg[1].strip().lower() if len(arg) > 1 else None
+    resumed = []
+    for b in brokers:
+        if target is None or b.cfg.account_id == target:
+            b.resume()
+            resumed.append(b.cfg.label)
+    if resumed:
+        await message.answer(f"✅ Стоп-кран снят для: {', '.join(resumed)}")
+    else:
+        await message.answer(f"Счёт '{target}' не найден.")
 
 
 @router.message(Command("consensus"))

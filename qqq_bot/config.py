@@ -73,8 +73,10 @@ class ConsensusConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    """Настройки боевого исполнения сделок. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО."""
+    """Настройки боевого исполнения для ОДНОГО счёта. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО."""
     enabled: bool = False
+    account_id: str = "ffa"       # короткий id счёта (ffa, tfos, ...)
+    label: str = "FFA"            # человекочитаемое имя для сообщений
     mode: str = "semi_auto"        # semi_auto | auto | off
     public_key: str = ""
     private_key: str = ""
@@ -112,7 +114,7 @@ class AppConfig:
     signal: SignalConfig
     option: OptionConfig
     consensus: ConsensusConfig
-    execution: ExecutionConfig
+    executions: tuple[ExecutionConfig, ...]
 
     cooldown_seconds: int
     strategy_id: int
@@ -128,6 +130,58 @@ def _require(name: str) -> str:
 def _default_cache_dir() -> Path:
     base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or str(Path.home())
     return Path(base) / "qqq_trading_bot_cache"
+
+
+def _load_executions() -> tuple[ExecutionConfig, ...]:
+    """
+    Загружает список торговых счетов из env.
+
+    EXEC_ACCOUNTS="ffa,tfos" — список id счетов через запятую (по умолчанию "ffa").
+    Для каждого счёта переменные с префиксом: {ID}_ENABLED, {ID}_PUBLIC_KEY и т.д.
+    Пример для tfos: TFOS_ENABLED, TFOS_PUBLIC_KEY, TFOS_PRIVATE_KEY, TFOS_POSITION_PCT...
+
+    Обратная совместимость: для "ffa" при отсутствии префиксных переменных
+    используются старые (EXEC_ENABLED, TRADERNET_PUBLIC_KEY, EXEC_POSITION_PCT...).
+    """
+    ids = [x.strip().lower() for x in os.getenv("EXEC_ACCOUNTS", "ffa").split(",") if x.strip()]
+    out: list[ExecutionConfig] = []
+
+    for acc_id in ids:
+        P = acc_id.upper()  # префикс переменных
+
+        def g(suffix: str, legacy: str | None = None, default: str = "") -> str:
+            # сначала префиксная переменная, затем (для ffa) legacy, затем default
+            v = os.getenv(f"{P}_{suffix}")
+            if v is not None:
+                return v
+            if acc_id == "ffa" and legacy is not None:
+                v = os.getenv(legacy)
+                if v is not None:
+                    return v
+            return default
+
+        label = g("LABEL", default=P)
+        cfg = ExecutionConfig(
+            enabled=g("ENABLED", "EXEC_ENABLED", "0") == "1",
+            account_id=acc_id,
+            label=label,
+            mode=g("MODE", "EXEC_MODE", "semi_auto"),
+            public_key=g("PUBLIC_KEY", "TRADERNET_PUBLIC_KEY", ""),
+            private_key=g("PRIVATE_KEY", "TRADERNET_PRIVATE_KEY", ""),
+            position_pct=float(g("POSITION_PCT", "EXEC_POSITION_PCT", "5.0")),
+            max_position_pct=float(g("MAX_POSITION_PCT", "EXEC_MAX_POSITION_PCT", "10.0")),
+            max_contracts=int(g("MAX_CONTRACTS", "EXEC_MAX_CONTRACTS", "50")),
+            max_orders_per_day=int(g("MAX_ORDERS_PER_DAY", "EXEC_MAX_ORDERS_PER_DAY", "20")),
+            max_notional_per_trade=float(g("MAX_NOTIONAL", "EXEC_MAX_NOTIONAL", "50000")),
+            hold_overnight_min_dte=int(g("HOLD_OVERNIGHT_MIN_DTE", "EXEC_HOLD_OVERNIGHT_MIN_DTE", "99")),
+            block_new_position_if_dte_lte=int(g("BLOCK_NEW_IF_DTE_LTE", "EXEC_BLOCK_NEW_IF_DTE_LTE", "0")),
+            require_reconcile=g("REQUIRE_RECONCILE", "EXEC_REQUIRE_RECONCILE", "1") == "1",
+            confirm_timeout_sec=int(g("CONFIRM_TIMEOUT_SEC", "EXEC_CONFIRM_TIMEOUT_SEC", "300")),
+            underlying_symbol=os.getenv("SYMBOL", "QQQ.US"),
+        )
+        out.append(cfg)
+
+    return tuple(out)
 
 
 def load_config() -> AppConfig:
@@ -193,22 +247,7 @@ def load_config() -> AppConfig:
         display_tz=os.getenv("DISPLAY_TZ", "America/New_York"),
         signal=signal,
         option=option,
-        execution=ExecutionConfig(
-            enabled=os.getenv("EXEC_ENABLED", "0") == "1",
-            mode=os.getenv("EXEC_MODE", "semi_auto"),
-            public_key=os.getenv("TRADERNET_PUBLIC_KEY", ""),
-            private_key=os.getenv("TRADERNET_PRIVATE_KEY", ""),
-            position_pct=float(os.getenv("EXEC_POSITION_PCT", "5.0")),
-            max_position_pct=float(os.getenv("EXEC_MAX_POSITION_PCT", "10.0")),
-            max_contracts=int(os.getenv("EXEC_MAX_CONTRACTS", "50")),
-            max_orders_per_day=int(os.getenv("EXEC_MAX_ORDERS_PER_DAY", "20")),
-            max_notional_per_trade=float(os.getenv("EXEC_MAX_NOTIONAL", "50000")),
-            hold_overnight_min_dte=int(os.getenv("EXEC_HOLD_OVERNIGHT_MIN_DTE", "99")),
-            block_new_position_if_dte_lte=int(os.getenv("EXEC_BLOCK_NEW_IF_DTE_LTE", "0")),
-            require_reconcile=os.getenv("EXEC_REQUIRE_RECONCILE", "1") == "1",
-            confirm_timeout_sec=int(os.getenv("EXEC_CONFIRM_TIMEOUT_SEC", "300")),
-            underlying_symbol=os.getenv("SYMBOL", "QQQ.US"),
-        ),
+        executions=_load_executions(),
         consensus=ConsensusConfig(
             enabled=os.getenv("CONSENSUS_ENABLED", "1") == "1",
             agree_window_bars=int(os.getenv("CONSENSUS_WINDOW_BARS", "12")),

@@ -143,36 +143,42 @@ async def _send_signal_to_channel(
 
     # ── Боевое исполнение (semi-auto): предложить ордер с кнопкой ─────────────
     exec_keyboard = None
-    if (app.broker is not None and app.broker.available
-            and rec is not None and rec.action_type in ("OPEN", "CLOSE")
-            and app.cfg.execution.mode == "semi_auto"):
+    if (app.brokers and rec is not None and rec.action_type in ("OPEN", "CLOSE")):
         try:
             price = await _fetch_option_price(app.tn, rec.tn_ticker)
             if price and price > 0:
-                if rec.action_type == "OPEN":
-                    summ = app.broker.account_summary()
-                    acct_val = app.broker.purchasing_power() or 0.0
-                    contracts = app.broker.calc_contracts(price, acct_val)
-                    side = "BUY"
-                else:  # CLOSE
-                    # закрываем столько, сколько в позиции (по журналу — 1 по умолчанию)
-                    contracts = 1
-                    side = "SELL" if rec.option_type == "CALL" else "BUY"
+                keyboard_rows = []
+                any_offer = False
+                for br in app.brokers:
+                    if not br.available or br.cfg.mode != "semi_auto":
+                        continue
+                    label = br.cfg.label
+                    if rec.action_type == "OPEN":
+                        acct_val = br.purchasing_power() or 0.0
+                        contracts = br.calc_contracts(price, acct_val)
+                        side = "BUY"
+                    else:  # CLOSE
+                        contracts = 1
+                        side = "SELL" if rec.option_type == "CALL" else "BUY"
 
-                if contracts >= 1:
-                    # прогоняем предохранители через preflight (не отправляя)
-                    from .broker import PendingOrder  # noqa
-                    po = app.broker.create_pending(
-                        tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
-                        limit_price=price, dte=rec.dte, is_open=(rec.action_type == "OPEN"),
-                    )
-                    from .handlers import build_confirm_keyboard
-                    exec_keyboard = build_confirm_keyboard(po.token)
-                    lines += ["", f"🎯 <b>Исполнение (semi-auto)</b>",
-                              f"{po.human}",
-                              f"⏳ подтверди в течение {app.cfg.execution.confirm_timeout_sec // 60} мин"]
-                else:
-                    lines += ["", "🎯 Исполнение: размер позиции = 0 контрактов (проверь % и баланс)"]
+                    if contracts >= 1:
+                        po = br.create_pending(
+                            tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
+                            limit_price=price, dte=rec.dte, is_open=(rec.action_type == "OPEN"),
+                        )
+                        # callback data: exec_ok:{account_id}:{token}
+                        from .handlers import build_account_confirm_row
+                        keyboard_rows += build_account_confirm_row(br.cfg.account_id, label, po.token)
+                        lines += ["", f"🎯 <b>{label}</b>: {po.human}"]
+                        any_offer = True
+                    else:
+                        lines += ["", f"🎯 <b>{label}</b>: размер = 0 контрактов (мал % или баланс)"]
+
+                if any_offer:
+                    from aiogram.types import InlineKeyboardMarkup
+                    exec_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+                    to = app.brokers[0].cfg.confirm_timeout_sec // 60
+                    lines += ["", f"⏳ подтверди в течение {to} мин"]
         except Exception as e:
             lines += ["", html.escape(f"[Исполнение: ошибка подготовки — {e}]")]
 
@@ -224,28 +230,34 @@ async def _amain() -> None:
                 app.stats.last_error = f"ML init: {repr(e)}"
                 app.ml_service = None
 
-        # Брокер для боевого исполнения (по умолчанию выключен, EXEC_ENABLED=0).
+        # Брокеры по счетам (ffa, tfos, ...). По умолчанию всё выключено.
         # Изолировано: ошибка инициализации не влияет на сигнальную работу.
+        app.brokers = []
         try:
             from .broker import Broker, ExecutionConfig as _EC
-            ex = cfg.execution
-            bcfg = _EC(
-                enabled=ex.enabled, mode=ex.mode,
-                public_key=ex.public_key, private_key=ex.private_key,
-                position_pct=ex.position_pct, max_position_pct=ex.max_position_pct,
-                max_contracts=ex.max_contracts, max_orders_per_day=ex.max_orders_per_day,
-                max_notional_per_trade=ex.max_notional_per_trade,
-                hold_overnight_min_dte=ex.hold_overnight_min_dte,
-                block_new_position_if_dte_lte=ex.block_new_position_if_dte_lte,
-                require_reconcile=ex.require_reconcile,
-                confirm_timeout_sec=ex.confirm_timeout_sec,
-                underlying_symbol=ex.underlying_symbol,
-            )
-            app.broker = Broker(bcfg)
-            if ex.enabled and app.broker.load_error:
-                app.stats.last_error = f"Broker load: {app.broker.load_error}"
+            for ex in cfg.executions:
+                bcfg = _EC(
+                    enabled=ex.enabled, account_id=ex.account_id, label=ex.label,
+                    mode=ex.mode, public_key=ex.public_key, private_key=ex.private_key,
+                    position_pct=ex.position_pct, max_position_pct=ex.max_position_pct,
+                    max_contracts=ex.max_contracts, max_orders_per_day=ex.max_orders_per_day,
+                    max_notional_per_trade=ex.max_notional_per_trade,
+                    hold_overnight_min_dte=ex.hold_overnight_min_dte,
+                    block_new_position_if_dte_lte=ex.block_new_position_if_dte_lte,
+                    require_reconcile=ex.require_reconcile,
+                    confirm_timeout_sec=ex.confirm_timeout_sec,
+                    underlying_symbol=ex.underlying_symbol,
+                )
+                br = Broker(bcfg)
+                app.brokers.append(br)
+                if ex.enabled and br.load_error:
+                    app.stats.last_error = f"Broker[{ex.account_id}] load: {br.load_error}"
+            # совместимость: app.broker = первый включённый
+            app.broker = next((b for b in app.brokers if b.available), 
+                              app.brokers[0] if app.brokers else None)
         except Exception as e:
             app.stats.last_error = f"Broker init: {repr(e)}"
+            app.brokers = []
             app.broker = None
 
         dp["app"] = app

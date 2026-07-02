@@ -50,6 +50,8 @@ STAT_CANCELLED = 2      # отменён
 @dataclass
 class ExecutionConfig:
     enabled: bool = False              # ГЛАВНЫЙ рубильник: исполнение вообще включено?
+    account_id: str = "ffa"            # короткий id счёта
+    label: str = "FFA"                 # имя для сообщений
     mode: str = "semi_auto"            # "semi_auto" (подтверждение) | "auto" | "off"
     public_key: str = ""
     private_key: str = ""

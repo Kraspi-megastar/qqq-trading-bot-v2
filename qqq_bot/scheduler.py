@@ -66,7 +66,8 @@ class AppState:
     consensus_state: ConsensusState = field(default_factory=ConsensusState)
     ml_service: object | None = None                 # MLTradingService | None (advisory)
     strategy2_for_consensus: Strategy2State = field(default_factory=Strategy2State)  # #2 считается всегда
-    broker: object | None = None                     # Broker | None (боевое исполнение)
+    broker: object | None = None                     # deprecated single broker (совместимость)
+    brokers: list = field(default_factory=list)      # список Broker по счетам (ffa, tfos, ...)
 
     def set_strategy(self, strategy_id: int) -> None:
         """
@@ -550,31 +551,27 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             "s2", signal_to_vote(dec2.action), dec2.reason[:40]
                         )
 
-                    # ML advisory
-                    if app.ml_service is not None:
+                    # ML advisory — берём СЫРЫЕ вероятности модели, независимо от
+                    # действия стратегии #1. decide() зануляет вероятности при
+                    # base_signal=HOLD / вне сессии, что нам НЕ нужно для консенсуса:
+                    # ML должен голосовать своим мнением каждый бар.
+                    if app.ml_service is not None and getattr(app.ml_service, "predictor", None) is not None:
                         try:
-                            pos_type = app.option_position.option_type if app.option_position else None
-                            ml_dec = app.ml_service.decide(
-                                bars=df_sig.rename(columns={"ts": "timestamp"}),
-                                base_signal=decision.action if decision.action in ("BUY", "SELL") else "HOLD",
+                            pred = app.ml_service.predictor.predict_latest(
+                                df_sig.rename(columns={"ts": "timestamp"}),
                                 strategy_context={
                                     "symbol": cfg.symbol,
-                                    "timeframe": cfg.timeframe_minutes,
-                                    "session": "regular" if _is_rth_open(now, cfg.display_tz) else "ext",
-                                    "strategy_id": app.strategy_id,
                                     "timeframe_minutes": cfg.timeframe_minutes,
+                                    "strategy_id": app.strategy_id,
                                 },
-                                current_position=(app.option_position.option_type if app.option_position else None),
                             )
-                            mlv, mld = ml_to_vote(
-                                getattr(ml_dec, "long_prob", 0.5),
-                                getattr(ml_dec, "short_prob", 0.5),
-                                cfg.consensus.ml_min_edge,
-                            )
+                            long_p = float(pred.get("long_prob", 0.5))
+                            short_p = float(pred.get("short_prob", 0.5))
+                            mlv, mld = ml_to_vote(long_p, short_p, cfg.consensus.ml_min_edge)
                             if mlv != 0:
                                 app.consensus_state.set_vote("ml", mlv, mld)
                         except Exception as e:
-                            app.stats.last_error = f"ml_decide: {repr(e)}"
+                            app.stats.last_error = f"ml_predict: {repr(e)}"
 
                     consensus_res = compute_consensus(app.consensus_state, cfg.consensus)
                 except Exception as e:
@@ -807,10 +804,10 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
             app.stats.last_error = repr(e)
             logger.exception("polling_loop iteration error")
 
-        # Чистим протухшие ожидания подтверждения (semi-auto тайм-аут)
-        if app.broker is not None:
+        # Чистим протухшие ожидания подтверждения (semi-auto тайм-аут) по всем счетам
+        for _br in (getattr(app, "brokers", []) or []):
             try:
-                app.broker.purge_expired_pending()
+                _br.purge_expired_pending()
             except Exception:
                 pass
 
