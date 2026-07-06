@@ -158,8 +158,25 @@ async def _send_signal_to_channel(
                         contracts = br.calc_contracts(price, acct_val)
                         side = "BUY"
                     else:  # CLOSE
-                        contracts = 1
-                        side = "SELL" if rec.option_type == "CALL" else "BUY"
+                        # Закрытие = продать то, что БЫЛО КУПЛЕНО при открытии.
+                        # И CALL, и PUT открываются через BUY, поэтому закрытие
+                        # ВСЕГДА SELL. Количество берём из реальной позиции у брокера
+                        # (не хардкодим), чтобы закрыть ровно столько, сколько открыто.
+                        side = "SELL"
+                        contracts = 0
+                        try:
+                            for p in br.get_positions():
+                                if str(p.get("i", "")) == rec.tn_ticker:
+                                    q = int(abs(int(p.get("q", 0))))
+                                    contracts = q
+                                    break
+                        except Exception:
+                            contracts = 0
+                        # если у брокера позиции нет — закрывать нечего
+                        if contracts < 1:
+                            lines += ["", f"🎯 <b>{label}</b>: закрывать нечего "
+                                          f"(позиции {rec.tn_ticker} нет у брокера)"]
+                            continue
 
                     if contracts >= 1:
                         po = br.create_pending(
