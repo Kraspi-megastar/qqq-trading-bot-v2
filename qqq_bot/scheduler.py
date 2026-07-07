@@ -589,6 +589,18 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                 pass
 
             # 5) График
+            # ВАЖНО: записываем свежий сигнал в историю ДО отрисовки графика,
+            # иначе треугольник появится с опозданием на один цикл.
+            if rolled and decision.action in ("BUY", "SELL") and len(df_sig) > 0:
+                try:
+                    _sig_ts = df_sig["ts"].iloc[-1]
+                    if not isinstance(_sig_ts, datetime):
+                        _sig_ts = pd.to_datetime(_sig_ts, utc=True, errors="coerce").to_pydatetime()
+                    _sig_price = float(df_sig["close"].iloc[-1])
+                    _record_signal(app, decision.action, _sig_ts, _sig_price)
+                except Exception:
+                    pass
+
             chart_path = cfg.cache_dir / "chart.png"
             await asyncio.to_thread(
                 plot_chart,
