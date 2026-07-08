@@ -78,6 +78,17 @@ class ConsensusState:
         elif source == "ml":
             self.ml = sv
 
+    def clear_vote(self, source: str) -> None:
+        """Сбрасывает голос источника в нейтральный (для непрерывных источников,
+        когда текущая оценка стала нейтральной — старый голос не должен висеть)."""
+        empty = SourceVote()
+        if source == "s1":
+            self.s1 = empty
+        elif source == "s2":
+            self.s2 = empty
+        elif source == "ml":
+            self.ml = empty
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Результат расчёта консенсуса
@@ -133,6 +144,77 @@ def ml_to_vote(long_prob: float, short_prob: float, min_edge: float) -> tuple[in
     if edge <= -min_edge:
         return -1, f"L={long_prob:.2f} S={short_prob:.2f} edge={edge:.2f}"
     return 0, f"L={long_prob:.2f} S={short_prob:.2f} edge={edge:.2f} (нейтр.)"
+
+
+def strategy2_regime_vote(row, min_agree: int = 3) -> tuple[int, str]:
+    """
+    Непрерывная оценка "режима" по логике стратегии #2 — голос каждый бар.
+
+    В отличие от точечного входа #2 (нужны все 5 условий разом), здесь
+    считаем бычьи/медвежьи признаки по 4 индикаторам и голосуем по большинству:
+      - close vs VWAP
+      - MACD vs сигнальная линия
+      - Supertrend направление
+      - RSI vs 50
+
+    Сумма признаков от -4 до +4. Голос:
+      +1 если бычьих признаков >= min_agree (по умолчанию 3 из 4)
+      -1 если медвежьих признаков >= min_agree
+       0 иначе (индикаторы противоречат друг другу)
+
+    row — строка DataFrame (df.iloc[-1]) с колонками close, vwap, macd,
+    macd_signal, supertrend_dir, rsi.
+    Возвращает (vote, detail).
+    """
+    def _f(key):
+        try:
+            v = row[key]
+            return float(v) if v is not None else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    close = _f("close")
+    vwap_v = _f("vwap")
+    macd_v = _f("macd")
+    macd_sig = _f("macd_signal")
+    st_dir = _f("supertrend_dir")
+    rsi_v = _f("rsi")
+
+    signals = []  # +1 бычий / -1 медвежий по каждому признаку
+    parts = []
+
+    if close is not None and vwap_v is not None:
+        s = 1 if close > vwap_v else -1
+        signals.append(s)
+        parts.append(f"VWAP{'+' if s > 0 else '-'}")
+
+    if macd_v is not None and macd_sig is not None:
+        s = 1 if macd_v > macd_sig else -1
+        signals.append(s)
+        parts.append(f"MACD{'+' if s > 0 else '-'}")
+
+    if st_dir is not None:
+        s = 1 if st_dir > 0 else -1
+        signals.append(s)
+        parts.append(f"ST{'+' if s > 0 else '-'}")
+
+    if rsi_v is not None:
+        s = 1 if rsi_v > 50 else -1
+        signals.append(s)
+        parts.append(f"RSI{'+' if s > 0 else '-'}")
+
+    if not signals:
+        return 0, "нет данных"
+
+    bulls = sum(1 for s in signals if s > 0)
+    bears = sum(1 for s in signals if s < 0)
+    detail = " ".join(parts) + f" ({bulls}↑/{bears}↓)"
+
+    if bulls >= min_agree:
+        return 1, detail
+    if bears >= min_agree:
+        return -1, detail
+    return 0, detail
 
 
 # ────────────────────────────────────────────────────────────────────────────

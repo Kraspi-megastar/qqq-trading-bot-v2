@@ -539,17 +539,22 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             f"score={dec1.details.get('buy_score', dec1.details.get('sell_score', '?'))}"
                         )
 
-                    # #2 всегда (отдельное состояние, чтобы не мешать основному)
-                    dec2 = compute_signal(
-                        df_sig, cfg.signal, strategy_id=2,
-                        state=app.strategy2_for_consensus,
-                    )
-                    if dec2.new_state is not None:
-                        app.strategy2_for_consensus = dec2.new_state
-                    if dec2.action in ("BUY", "SELL"):
-                        app.consensus_state.set_vote(
-                            "s2", signal_to_vote(dec2.action), dec2.reason[:40]
+                    # #2 в консенсусе: НЕПРЕРЫВНАЯ оценка режима (голос каждый бар),
+                    # а не редкий точечный вход. Считаем по 4 индикаторам
+                    # (VWAP, MACD, Supertrend, RSI), голос при >=3 согласных из 4.
+                    try:
+                        from .consensus import strategy2_regime_vote
+                        s2_vote, s2_detail = strategy2_regime_vote(
+                            df_sig.iloc[-1], min_agree=3
                         )
+                        if s2_vote != 0:
+                            app.consensus_state.set_vote("s2", s2_vote, s2_detail)
+                        else:
+                            # режим стал нейтральным — сбрасываем старый голос #2,
+                            # чтобы он не висел 12 баров (это непрерывный источник)
+                            app.consensus_state.clear_vote("s2")
+                    except Exception as e:
+                        app.stats.last_error = f"s2_regime: {repr(e)}"
 
                     # ML advisory — берём СЫРЫЕ вероятности модели, независимо от
                     # действия стратегии #1. decide() зануляет вероятности при
@@ -570,6 +575,8 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             mlv, mld = ml_to_vote(long_p, short_p, cfg.consensus.ml_min_edge)
                             if mlv != 0:
                                 app.consensus_state.set_vote("ml", mlv, mld)
+                            else:
+                                app.consensus_state.clear_vote("ml")
                         except Exception as e:
                             app.stats.last_error = f"ml_predict: {repr(e)}"
 
