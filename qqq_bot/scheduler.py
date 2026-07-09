@@ -638,28 +638,18 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                 auto_rec = None
                 auto_reason_text = None
 
-                # Приоритет 0: конфликт консенсуса — если ОБА других источника
-                # (#2 и ML) единогласно против позиции, закрываем досрочно.
-                if (consensus_res is not None and can_close_now and spot_now is not None
-                        and getattr(cfg, "consensus", None) and cfg.consensus.enabled):
-                    pos_type = app.option_position.option_type
-                    s2_against, ml_against = consensus_res.votes_against(pos_type)
-                    if s2_against and ml_against:
-                        auto_rec = build_close_recommendation(
-                            app.option_position, spot_now, ocfg, reason="conflict_close"
-                        )
-                        auto_reason_text = format_conflict_warning(
-                            consensus_res, pos_type, will_close=True
-                        )
-                        app.pending_close = None
+                # Вариант А: КОНСЕНСУС БОЛЬШЕ НЕ ЗАКРЫВАЕТ ПОЗИЦИЮ.
+                # Позицией управляет только стратегия #1 (вход и выход) + force_close.
+                # Консенсус остаётся информацией в сообщении сигнала и может лишь
+                # ПРЕДУПРЕДИТЬ о расхождении (без действия) — см. отправку сигнала.
 
-                if auto_rec is None and force and spot_now is not None:
-                    # Конец дня — закрываем принудительно (приоритет над окнами)
+                if force and spot_now is not None:
+                    # Конец дня — закрываем принудительно (риск овернайта, не сигнал)
                     auto_rec = build_close_recommendation(
                         app.option_position, spot_now, ocfg, reason="force_close"
                     )
                     app.pending_close = None
-                elif auto_rec is None and app.pending_close is not None and can_close_now and spot_now is not None:
+                elif app.pending_close is not None and can_close_now and spot_now is not None:
                     # Рынок открылся — исполняем отложенное закрытие по живой цене
                     auto_rec = build_close_recommendation(
                         app.option_position, spot_now, ocfg, reason="pending_close"
@@ -668,8 +658,18 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
 
                 if auto_rec is not None:
                     try:
+                        # Метка направления для заголовка: закрытие CALL = SELL,
+                        # закрытие PUT = BUY (обратное открытию). Это чисто ярлык
+                        # для отображения; реальное направление ордера брокеру
+                        # определяется в bot.py (закрытие всегда SELL опциона).
+                        close_label = "SELL" if app.option_position and app.option_position.option_type == "CALL" else "BUY"
+                        reason_name = {
+                            "force_close": "принудительное закрытие (конец дня)",
+                            "pending_close": "отложенное закрытие",
+                            "conflict_close": "закрытие по конфликту консенсуса",
+                        }.get(auto_rec.delta_source, "закрытие")
                         await send_signal_cb(
-                            SignalDecision("SELL", f"Опцион: {auto_rec.delta_source}", {}),
+                            SignalDecision(close_label, f"Опцион: {reason_name}", {}),
                             str(cfg.cache_dir / "chart.png"),
                             df.iloc[:-1] if len(df) >= 2 else df,
                             auto_rec,
