@@ -76,6 +76,12 @@ def plot_chart(
     # SIGNAL MARKERS (triangles)
     if signal_history:
         ts_to_idx = {ts_iso.iloc[i]: i for i in range(len(ts_iso)) if ts_iso.iloc[i]}
+        # для fallback: числовой timestamp каждого бара (для поиска ближайшего)
+        # наносекунды с эпохи для каждого бара (для поиска ближайшего).
+        try:
+            ts_epoch = ts.dt.tz_convert("UTC").dt.tz_localize(None).astype("datetime64[ns]").astype("int64").to_numpy()
+        except Exception:
+            ts_epoch = ts.astype("int64").to_numpy()
         buy_x, buy_y, sell_x, sell_y = [], [], [], []
         seen = set()
 
@@ -90,20 +96,39 @@ def plot_chart(
             if action not in ("BUY", "SELL"):
                 continue
 
-            # ВОТ ОНО: ts_key определяем всегда
             try:
-                ts_key = pd.to_datetime(ts_obj, utc=True, errors="coerce").strftime("%Y-%m-%dT%H:%M:%SZ")
+                ts_dt = pd.to_datetime(ts_obj, utc=True, errors="coerce")
+                ts_key = ts_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             except Exception:
+                ts_dt = None
                 ts_key = ""
 
             if not ts_key:
                 continue
 
+            # 1) точное совпадение по строке timestamp
             idx = ts_to_idx.get(ts_key)
+
+            # 2) fallback: ближайший бар в пределах одного таймфрейма.
+            #    Раньше при малейшем расхождении формата треугольник ПРОПАДАЛ
+            #    (idx is None → continue). Теперь ищем ближайший бар.
+            if idx is None and ts_dt is not None:
+                try:
+                    _t = pd.Timestamp(ts_dt)
+                    if _t.tz is not None:
+                        _t = _t.tz_convert("UTC").tz_localize(None)
+                    target = int(_t.value)  # наносекунды
+                    diffs = np.abs(ts_epoch - target)
+                    nearest = int(np.argmin(diffs))
+                    # принимаем только если ближайший бар в пределах ~1 бара (10 мин)
+                    if diffs[nearest] <= 10 * 60 * 1_000_000_000:
+                        idx = nearest
+                except Exception:
+                    idx = None
+
             if idx is None:
                 continue
 
-            # y: если цена сохранена — используем её, иначе close бара
             if isinstance(price_hint, (int, float)):
                 yv = float(price_hint)
             else:
@@ -118,10 +143,10 @@ def plot_chart(
             seen.add(k)
 
             if action == "BUY":
-                buy_x.append(idx);
+                buy_x.append(idx)
                 buy_y.append(yv)
             else:
-                sell_x.append(idx);
+                sell_x.append(idx)
                 sell_y.append(yv)
 
         if buy_x:
