@@ -782,3 +782,81 @@ async def cmd_strategy_any(message: Message, app: AppState) -> None:
         )
         + "</pre>"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# КОМАНДЫ ИЗ КАНАЛОВ (channel_post)
+# ══════════════════════════════════════════════════════════════════════════
+# В Telegram сообщения, отправленные в канал, приходят как channel_post,
+# а не как message — поэтому обычные @router.message(Command(...)) на них
+# НЕ срабатывают. Регистрируем их отдельно.
+#
+# БЕЗОПАСНОСТЬ: в каналах доступны ТОЛЬКО информационные команды.
+# Команды боевого исполнения (/account, /orders, /positions, /halt,
+# /resume, /exec_status) и служебные (/config, /dump, /optest, /strategy)
+# намеренно НЕ регистрируются: они раскрывают баланс счетов и управляют
+# реальными деньгами. Ими можно пользоваться только в личке с ботом.
+
+_CHANNEL_SAFE_COMMANDS: dict[str, str] = {
+    "help":      "список доступных в канале команд",
+    "status":    "состояние бота и сессии",
+    "stats":     "статистика работы",
+    "chart":     "текущий график с сигналами",
+    "last":      "последний сигнал",
+    "consensus": "консенсус источников",
+    "options":   "текущая опционная позиция",
+    "trades":    "последние закрытые сделки",
+    "dayreport": "дневной отчёт",
+    "ping":      "проверка отклика",
+}
+
+
+def _channel_allowed(app: AppState, chat_id: int) -> bool:
+    """Бот отвечает на команды только в СВОИХ каналах (основной и публичный)."""
+    allowed = {
+        int(getattr(app.cfg, "telegram_channel_id", 0) or 0),
+        int(getattr(app.cfg, "telegram_public_channel_id", 0) or 0),
+    }
+    allowed.discard(0)
+    return int(chat_id) in allowed
+
+
+def _wrap_for_channel(fn):
+    """Оборачивает обычный хендлер: пускаем только в разрешённых каналах."""
+    async def _handler(message: Message, app: AppState) -> None:
+        if not _channel_allowed(app, message.chat.id):
+            return
+        await fn(message, app)
+    return _handler
+
+
+async def cmd_help_channel(message: Message, app: AppState) -> None:
+    """Справка для канала — только доступные здесь команды."""
+    if not _channel_allowed(app, message.chat.id):
+        return
+    lines = ["<b>Доступные команды</b>", ""]
+    for name, desc in _CHANNEL_SAFE_COMMANDS.items():
+        lines.append(f"/{name} — {desc}")
+    await message.answer("\n".join(lines))
+
+
+def register_channel_commands() -> None:
+    """Регистрирует безопасные команды для channel_post."""
+    _handlers = {
+        "status":    cmd_status,
+        "stats":     cmd_stats,
+        "chart":     cmd_chart,
+        "last":      cmd_last,
+        "consensus": cmd_consensus,
+        "options":   cmd_options,
+        "trades":    cmd_trades,
+        "dayreport": cmd_dayreport,
+        "ping":      cmd_ping,
+    }
+    # /help в канале — своя укороченная справка
+    router.channel_post.register(cmd_help_channel, Command("help"))
+    for _name, _fn in _handlers.items():
+        router.channel_post.register(_wrap_for_channel(_fn), Command(_name))
+
+
+register_channel_commands()

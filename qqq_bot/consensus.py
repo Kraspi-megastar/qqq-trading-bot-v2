@@ -299,6 +299,24 @@ def format_consensus(res: ConsensusResult) -> str:
     return "\n".join(lines)
 
 
+def format_consensus_public(res: ConsensusResult) -> str:
+    """
+    Компактная разбивка для публичного канала.
+    Источники обезличены: #1 / #2 / #3, ML назван "Predict".
+    """
+    lines = [
+        "📊 <b>Консенсус источников</b>",
+        f"Итоговый балл: <b>{res.score:+.1f}</b> ({_AGREEMENT_RU.get(res.agreement, res.agreement)})",
+        "",
+        f"#1:  {_vote_symbol(res.s1_vote, res.s1_active)}",
+        f"#2:  {_vote_symbol(res.s2_vote, res.s2_active)}",
+        f"#3:  {_vote_symbol(res.ml_vote, res.ml_active)}",
+    ]
+    if res.ml_active and res.ml_detail:
+        lines.append(f"(Predict): {res.ml_detail}")
+    return "\n".join(lines)
+
+
 def format_conflict_warning(res: ConsensusResult, position_type: str, will_close: bool) -> str:
     """Предупреждение о конфликте против открытой позиции."""
     pos_ru = "CALL (лонг)" if position_type == "CALL" else "PUT (шорт)"

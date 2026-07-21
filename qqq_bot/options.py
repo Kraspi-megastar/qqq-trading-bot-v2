@@ -148,6 +148,46 @@ def tradernet_option_ticker(option_type: str, strike: float, expiry: date) -> st
     return f"+QQQ.{date_str}.{ot}{strike_str}"
 
 
+def das_trader_ticker(option_type: str, strike: float, expiry: date,
+                      symbol: str = "qqq") -> str:
+    """
+    Формат DasTrader: +qqq^G7L703
+
+    Состоит из 5 частей:
+      1. знак "+"
+      2. тикер базового актива (в нижнем регистре)
+      3. индикатор типа: "^" для CALL, "*" для PUT
+      4. дата экспирации, 3 символа:
+         - год:   2010=0, 2011=1 ... 2019=9, 2020=A, 2021=B ... 2035=Z
+         - месяц: 1-9 = цифры, 10=A, 11=B, 12=C
+         - день:  1-9 = цифры, 10=A, 11=B ... 31=V
+      5. страйк
+
+    Пример: CALL QQQ, экспирация 21 Jul 2026, страйк 703
+            год 2026 → G, месяц 7 → 7, день 21 → L  ⇒  +qqq^G7L703
+    """
+    # Алфавит для кодирования: 0-9, затем A-Z (индекс = сам символ)
+    _ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    def _at(idx: int, what: str) -> str:
+        if idx < 0 or idx >= len(_ALPHABET):
+            raise ValueError(f"{what}: значение вне диапазона кодирования ({idx})")
+        return _ALPHABET[idx]
+
+    ind = "^" if str(option_type).upper() == "CALL" else "*"
+
+    # год: смещение от 2010 (2010→'0', 2019→'9', 2020→'A', 2026→'G', 2035→'Z')
+    year_ch = _at(expiry.year - 2010, "год")
+    # месяц: прямой индекс (1-9 → '1'-'9', 10→'A', 11→'B', 12→'C')
+    month_ch = _at(expiry.month, "месяц")
+    # день: прямой индекс (1-9 → '1'-'9', 10→'A', ..., 21→'L', 31→'V')
+    day_ch = _at(expiry.day, "день")
+
+    strike_str = str(int(strike)) if float(strike) == int(strike) else f"{strike:g}"
+
+    return f"+{symbol.lower()}{ind}{year_ch}{month_ch}{day_ch}{strike_str}"
+
+
 def _moneyness(option_type: str, strike: float, price: float, step: float) -> str:
     if abs(strike - price) <= step * 0.5:
         return "ATM"
@@ -563,6 +603,49 @@ def format_option_message(rec: OptionRecommendation) -> str:
         lines.append(f"Дельта: {rec.delta:.3f}  (источник: {rec.delta_source})")
     lines += [
         f"Экспирация: {rec.expiry.strftime('%d %b %Y')}  ({rec.dte} DTE)",
+        f"QQQ сейчас: {rec.underlying_price:.2f}",
+    ]
+    return "\n".join(lines)
+
+
+def format_option_message_public(rec: OptionRecommendation, symbol: str = "qqq") -> str:
+    """
+    Компактное сообщение об опционе для публичного канала (без служебных
+    подробностей: без источника дельты, без внутренних причин закрытия).
+    Добавляет тикер в формате DasTrader.
+    """
+    if rec.skipped_market_closed and rec.action_type in ("HOLD", "OPEN"):
+        return "⏸ <b>Опцион: пропуск</b> (рынок опционов закрыт)"
+    if rec.skipped_no_contract:
+        return "⚠️ <b>Опцион: контракт не найден</b>"
+
+    if rec.action_type == "OPEN":
+        emoji = "📈" if rec.option_type == "CALL" else "📉"
+        header = f"{emoji} <b>Опцион: ОТКРЫТЬ {rec.option_type}</b>"
+    elif rec.action_type == "CLOSE":
+        header = f"🔒 <b>Опцион: ЗАКРЫТЬ {rec.option_type}</b>"
+    else:  # HOLD
+        if rec.new_position is not None:
+            header = f"⏸ <b>Опцион: ДЕРЖАТЬ {rec.option_type}</b>"
+        else:
+            return "⏸ <b>Опцион: нет действия</b>"
+
+    # Тикер DasTrader (может не построиться для служебных заглушек)
+    try:
+        das = das_trader_ticker(rec.option_type, rec.strike, rec.expiry, symbol=symbol)
+    except Exception:
+        das = "-"
+
+    lines = [
+        header,
+        f"Тикер DasTrader: <code>{das}</code>",
+        f"TraderNet: <code>{rec.tn_ticker}</code>",
+        f"Страйк: {rec.strike:.0f} | {rec.moneyness}",
+    ]
+    if rec.delta is not None:
+        lines.append(f"Дельта: {rec.delta:.3f}")
+    lines += [
+        f"Экспирация: {rec.expiry.strftime('%d %b %Y')} ({rec.dte} DTE)",
         f"QQQ сейчас: {rec.underlying_price:.2f}",
     ]
     return "\n".join(lines)

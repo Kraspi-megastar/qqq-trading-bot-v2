@@ -59,6 +59,7 @@ async def _send_signal_to_channel(
     rec: OptionRecommendation | None,
     session: aiohttp.ClientSession,
     extra_text: str | None = None,
+    consensus_res=None,
 ) -> None:
     import pandas as pd
 
@@ -208,6 +209,54 @@ async def _send_signal_to_channel(
         reply_markup=exec_keyboard,
     )
 
+    # ── Второй канал: только сигнал, без исполнения ──────────────────────────
+    # Компактный формат для тестировщиков/подписчиков. Ошибка отправки сюда
+    # НЕ должна ломать основной канал, поэтому всё в try/except.
+    pub_id = getattr(app.cfg, "telegram_public_channel_id", 0)
+    if pub_id:
+        try:
+            pub_caption = _build_public_caption(app, decision, rec, consensus_res)
+            await bot.send_photo(
+                chat_id=pub_id,
+                photo=FSInputFile(chart_path),
+                caption=pub_caption,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            app.stats.last_error = f"public_channel: {repr(e)}"
+
+
+def _build_public_caption(app: AppState, decision: SignalDecision,
+                          rec: OptionRecommendation | None, consensus_res=None) -> str:
+    """
+    Компактное сообщение для публичного канала:
+    направление + опцион (с тикером DasTrader) + консенсус.
+    Без индикаторов, без исполнения, без служебных деталей.
+    """
+    from .options import format_option_message_public
+
+    if decision.action == "BUY":
+        head = "🟢 BUY"
+    elif decision.action == "SELL":
+        head = "🔴 SELL"
+    else:
+        head = f"⏸ {decision.action}"
+
+    parts = [head]
+
+    if rec is not None:
+        base_symbol = str(getattr(app.cfg, "symbol", "QQQ")).split(".")[0].lower()
+        parts.append(format_option_message_public(rec, symbol=base_symbol))
+
+    if consensus_res is not None:
+        try:
+            from .consensus import format_consensus_public
+            parts += ["", format_consensus_public(consensus_res)]
+        except Exception:
+            pass
+
+    return "\n".join(parts)
+
 
 async def _amain() -> None:
     cfg = load_config()
@@ -281,8 +330,10 @@ async def _amain() -> None:
 
         asyncio.create_task(bootstrap_history(app))
 
-        async def sender(decision: SignalDecision, chart_path: str, df_sig, rec=None, extra_text=None) -> None:
-            await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, rec, session, extra_text)
+        async def sender(decision: SignalDecision, chart_path: str, df_sig, rec=None,
+                         extra_text=None, consensus_res=None) -> None:
+            await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, rec,
+                                          session, extra_text, consensus_res)
 
         asyncio.create_task(polling_loop(app, sender))
 

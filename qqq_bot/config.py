@@ -119,6 +119,9 @@ class AppConfig:
     cooldown_seconds: int
     strategy_id: int
 
+    # Второй канал: только сигналы, без боевого исполнения (0 = выключен)
+    telegram_public_channel_id: int = 0
+
 
 def _require(name: str) -> str:
     v = os.getenv(name)
@@ -232,6 +235,7 @@ def load_config() -> AppConfig:
     return AppConfig(
         telegram_bot_token=_require("TELEGRAM_BOT_TOKEN"),
         telegram_channel_id=int(_require("TELEGRAM_CHANNEL_ID")),
+        telegram_public_channel_id=int(os.getenv("TELEGRAM_PUBLIC_CHANNEL_ID", "0") or 0),
         symbol=os.getenv("SYMBOL", "QQQ.US"),
         timeframe_minutes=int(os.getenv("TIMEFRAME_MINUTES", "5")),
         poll_seconds=int(os.getenv("POLL_SECONDS", "10")),

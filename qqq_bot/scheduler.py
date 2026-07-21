@@ -807,7 +807,8 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             consensus_text = None
                             if consensus_res is not None:
                                 consensus_text = format_consensus(consensus_res)
-                            await send_signal_cb(decision, str(signal_chart_path), df_sig, rec, consensus_text)
+                            await send_signal_cb(decision, str(signal_chart_path), df_sig, rec,
+                                                 consensus_text, consensus_res)
                             try:
                                 app.persist_state(now)
                             except Exception as e:
