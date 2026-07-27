@@ -267,6 +267,86 @@ def _build_public_caption(app: AppState, decision: SignalDecision,
     return "\n".join(parts)
 
 
+async def _setup_command_menus(bot, app) -> None:
+    """
+    Задаёт меню команд по областям видимости (scopes).
+
+    Личка владельца — полный набор (включая настройки и исполнение).
+    Твои каналы — только информационные команды (для тестировщиков/подписчиков).
+    По умолчанию — минимальный набор.
+    """
+    from aiogram.types import (
+        BotCommand,
+        BotCommandScopeDefault,
+        BotCommandScopeChat,
+    )
+    from .handlers import OWNER_USER_ID
+
+    def _cmds(pairs):
+        return [BotCommand(command=c, description=d) for c, d in pairs]
+
+    # Полное меню (личка владельца)
+    full = _cmds([
+        ("help", "Список команд"),
+        ("status", "Состояние бота и сессия"),
+        ("consensus", "Консенсус источников"),
+        ("chart", "График с сигналами"),
+        ("last", "Последний сигнал"),
+        ("options", "Текущая опционная позиция"),
+        ("dayreport", "Дневной отчёт"),
+        ("trades", "Последние сделки"),
+        ("settings", "Настройки (стоп, размер)"),
+        ("set_stop", "Стоп-лосс: /set_stop 30"),
+        ("set_pct", "Размер позиции: /set_pct 5"),
+        ("set_contracts", "Макс контрактов: /set_contracts 2"),
+        ("account", "Балансы по счетам"),
+        ("positions", "Открытые позиции"),
+        ("orders", "Активные ордера"),
+        ("exec_status", "Статус исполнения"),
+        ("halt", "СТОП-КРАН"),
+        ("resume", "Снять стоп-кран"),
+        ("stats", "Статистика"),
+        ("ping", "Проверка отклика"),
+    ])
+
+    # Информационное меню (каналы — тестировщики/подписчики)
+    info = _cmds([
+        ("help", "Список команд"),
+        ("status", "Состояние бота"),
+        ("consensus", "Консенсус источников"),
+        ("chart", "График с сигналами"),
+        ("last", "Последний сигнал"),
+        ("options", "Текущая позиция"),
+        ("trades", "Последние сделки"),
+        ("dayreport", "Дневной отчёт"),
+        ("stats", "Статистика"),
+    ])
+
+    # Минимум по умолчанию
+    default = _cmds([
+        ("help", "Список команд"),
+        ("status", "Состояние бота"),
+    ])
+
+    # 1) дефолт везде
+    await bot.set_my_commands(default, scope=BotCommandScopeDefault())
+
+    # 2) полное меню — в личке владельца
+    try:
+        await bot.set_my_commands(full, scope=BotCommandScopeChat(chat_id=OWNER_USER_ID))
+    except Exception as e:
+        app.stats.last_error = f"menu owner: {repr(e)}"
+
+    # 3) информационное меню — в твоих каналах (по chat_id)
+    for ch in (getattr(app.cfg, "telegram_channel_id", 0),
+               getattr(app.cfg, "telegram_public_channel_id", 0)):
+        if ch:
+            try:
+                await bot.set_my_commands(info, scope=BotCommandScopeChat(chat_id=ch))
+            except Exception as e:
+                app.stats.last_error = f"menu chat {ch}: {repr(e)}"
+
+
 async def _amain() -> None:
     cfg = load_config()
 
@@ -389,6 +469,15 @@ async def _amain() -> None:
         app.on_rth_close_cb = on_rth_close
 
         asyncio.create_task(polling_loop(app, sender))
+
+        # Устанавливаем меню команд по областям (scopes):
+        #  - полное — в личке у владельца
+        #  - краткое информационное — в твоих каналах
+        #  - минимальное — по умолчанию везде
+        try:
+            await _setup_command_menus(bot, app)
+        except Exception as e:
+            app.stats.last_error = f"setup_menus: {repr(e)}"
 
         await dp.start_polling(bot)
 
