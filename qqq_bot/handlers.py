@@ -860,3 +860,112 @@ def register_channel_commands() -> None:
 
 
 register_channel_commands()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# НАСТРОЙКИ ЧЕРЕЗ ЧАТ (стоп-лосс, размер позиции)
+# ══════════════════════════════════════════════════════════════════════════
+# БЕЗОПАСНОСТЬ: менять настройки может ТОЛЬКО владелец и ТОЛЬКО в личке.
+# Это управление реальными деньгами, поэтому:
+#   - проверяем user_id == OWNER (жёстко зашит),
+#   - запрещаем в каналах/группах (только private chat).
+
+OWNER_USER_ID = 5770381568
+
+from .runtime_settings import RuntimeSettings, save_settings, format_settings
+
+
+def _is_owner_private(message: Message) -> bool:
+    """True только если это владелец И личный чат."""
+    try:
+        if message.chat.type != "private":
+            return False
+        if message.from_user is None or int(message.from_user.id) != OWNER_USER_ID:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_settings(app: AppState) -> RuntimeSettings:
+    if getattr(app, "settings", None) is None:
+        app.settings = RuntimeSettings()
+    return app.settings
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, app: AppState) -> None:
+    """Показать текущие настройки (стоп-лосс, размер). Доступно владельцу в личке."""
+    if not _is_owner_private(message):
+        return
+    await message.answer(format_settings(_ensure_settings(app)))
+
+
+@router.message(Command("set_stop"))
+async def cmd_set_stop(message: Message, app: AppState) -> None:
+    """/set_stop 30 — стоп-лосс 30%. /set_stop 0 — выключить."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /set_stop 30  (в %, или 0 для выключения)")
+        return
+    try:
+        val = float(parts[1].replace("%", "").replace(",", "."))
+    except ValueError:
+        await message.answer("Не понял число. Пример: /set_stop 30")
+        return
+    if val < 0 or val > 95:
+        await message.answer("Стоп-лосс должен быть в диапазоне 0–95%.")
+        return
+    s = _ensure_settings(app)
+    s.stop_loss_pct = val
+    save_settings(app.cfg.cache_dir, s)
+    stop = f"{val:.0f}%" if val > 0 else "выключен"
+    await message.answer(f"✅ Стоп-лосс: {stop}\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_contracts"))
+async def cmd_set_contracts(message: Message, app: AppState) -> None:
+    """/set_contracts 2 — максимум 2 контракта на сделку."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /set_contracts 2")
+        return
+    try:
+        val = int(parts[1])
+    except ValueError:
+        await message.answer("Не понял число. Пример: /set_contracts 2")
+        return
+    if val < 1 or val > 100:
+        await message.answer("Контрактов должно быть 1–100.")
+        return
+    s = _ensure_settings(app)
+    s.max_contracts = val
+    save_settings(app.cfg.cache_dir, s)
+    await message.answer(f"✅ Макс. контрактов: {val}\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_pct"))
+async def cmd_set_pct(message: Message, app: AppState) -> None:
+    """/set_pct 5 — размер позиции 5% от свободных денег."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /set_pct 5")
+        return
+    try:
+        val = float(parts[1].replace("%", "").replace(",", "."))
+    except ValueError:
+        await message.answer("Не понял число. Пример: /set_pct 5")
+        return
+    if val <= 0 or val > 100:
+        await message.answer("Процент должен быть в диапазоне 0–100.")
+        return
+    s = _ensure_settings(app)
+    s.position_pct = val
+    save_settings(app.cfg.cache_dir, s)
+    await message.answer(f"✅ Размер позиции: {val:.0f}% от свободных\n\n{format_settings(s)}")

@@ -68,6 +68,7 @@ class AppState:
     strategy2_for_consensus: Strategy2State = field(default_factory=Strategy2State)  # #2 считается всегда
     broker: object | None = None                     # deprecated single broker (совместимость)
     brokers: list = field(default_factory=list)      # список Broker по счетам (ffa, tfos, ...)
+    settings: object | None = None                   # RuntimeSettings (стоп-лосс, размер) — из чата
 
     def set_strategy(self, strategy_id: int) -> None:
         """
@@ -109,6 +110,20 @@ class AppState:
 # ────────────────────────────────────────────────────────────────────────────
 # Вспомогательные функции
 # ────────────────────────────────────────────────────────────────────────────
+
+async def _fetch_opt_price(app, tn_ticker: str):
+    """Живая цена опциона (mid или ltp). None при ошибке."""
+    try:
+        q = await asyncio.wait_for(app.tn.get_option_quote(tn_ticker), timeout=8.0)
+        if q is None:
+            return None
+        bid, ask, ltp = q.get("bid"), q.get("ask"), q.get("ltp")
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            return round((bid + ask) / 2, 4)
+        return ltp
+    except Exception:
+        return None
+
 
 def _session_id(now_utc: datetime, tz_name: str) -> str:
     if now_utc.tzinfo is None:
@@ -470,6 +485,26 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
 
             _maybe_reset_session(app, now)
 
+            # ── RTH-переходы: старт торгов → сводка настроек (закрытый канал);
+            #    конец торгов → авто-dayreport (оба канала) ────────────────────
+            try:
+                rth_now = _is_rth_open(now, cfg.display_tz)
+                prev_rth = getattr(app, "_prev_rth_open", None)
+                if prev_rth is not None and rth_now != prev_rth:
+                    if rth_now:
+                        # рынок только что открылся
+                        cb = getattr(app, "on_rth_open_cb", None)
+                        if cb is not None:
+                            await cb()
+                    else:
+                        # рынок только что закрылся
+                        cb = getattr(app, "on_rth_close_cb", None)
+                        if cb is not None:
+                            await cb()
+                app._prev_rth_open = rth_now
+            except Exception as e:
+                app.stats.last_error = f"rth_edge: {repr(e)}"
+
             session_open = _is_extended_session_open(now, cfg.display_tz)
             app.stats.session_state = "OPEN" if session_open else "CLOSED"
             app.stats.now_utc = now
@@ -655,6 +690,32 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                         app.option_position, spot_now, ocfg, reason="pending_close"
                     )
                     app.pending_close = None
+                else:
+                    # СТОП-ЛОСС: если позиция в минусе на >= настроенный %, предложить
+                    # закрытие досрочно (semi-auto, кнопкой). Настройка из чата.
+                    rs = getattr(app, "settings", None)
+                    stop_pct = float(getattr(rs, "stop_loss_pct", 0.0)) if rs else 0.0
+                    if (stop_pct > 0 and can_close_now and spot_now is not None
+                            and app.trade_journal is not None):
+                        try:
+                            tr = app.trade_journal.open_trade_for_ticker(
+                                app.option_position.tn_ticker)
+                            entry_p = getattr(tr, "entry_price", None) if tr else None
+                            if entry_p and entry_p > 0:
+                                cur_p = await _fetch_opt_price(app, app.option_position.tn_ticker)
+                                if cur_p is not None and cur_p > 0:
+                                    pnl_pct = (cur_p - entry_p) / entry_p * 100.0
+                                    if pnl_pct <= -stop_pct:
+                                        auto_rec = build_close_recommendation(
+                                            app.option_position, spot_now, ocfg,
+                                            reason="stop_loss"
+                                        )
+                                        auto_reason_text = (
+                                            f"🛑 Стоп-лосс: позиция в минусе "
+                                            f"{pnl_pct:.0f}% (порог −{stop_pct:.0f}%)"
+                                        )
+                        except Exception as e:
+                            app.stats.last_error = f"stop_loss: {repr(e)}"
 
                 if auto_rec is not None:
                     try:
@@ -667,6 +728,7 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             "force_close": "принудительное закрытие (конец дня)",
                             "pending_close": "отложенное закрытие",
                             "conflict_close": "закрытие по конфликту консенсуса",
+                            "stop_loss": "стоп-лосс",
                         }.get(auto_rec.delta_source, "закрытие")
                         await send_signal_cb(
                             SignalDecision(close_label, f"Опцион: {reason_name}", {}),

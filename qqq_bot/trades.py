@@ -196,3 +196,73 @@ class TradeJournal:
         if session_date:
             return [t for t in self._trades if t.session_date == session_date]
         return list(self._trades)
+
+
+def build_day_report(app, public: bool = False) -> str:
+    """
+    Дневной отчёт по опционным сделкам за сегодня.
+    public=False → полный ($, для закрытого канала).
+    public=True  → на 1 контракт ($ и %, для открытого канала).
+    """
+    import html as _html
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if app.trade_journal is None:
+        return "Журнал сделок недоступен."
+
+    tz = ZoneInfo(app.cfg.display_tz)
+    today_str = datetime.now(tz=tz).date().isoformat()
+    closed = app.trade_journal.closed_trades(session_date=today_str, limit=200)
+    with_pnl = [t for t in closed if t.pnl() is not None]
+    wins = [t for t in with_pnl if (t.pnl() or 0) > 0]
+    losses = [t for t in with_pnl if (t.pnl() or 0) <= 0]
+    win_rate = f"{len(wins)/len(with_pnl)*100:.0f}%" if with_pnl else "n/a"
+
+    if public:
+        # Публичная версия: суммы «на 1 контракт» (делим на число контрактов),
+        # показываем $ и %. Без абсолютных размеров позиции.
+        lines = [f"📋 <b>Итоги дня — {today_str}</b>", ""]
+        lines.append(f"Сделок: {len(with_pnl)} | ✅ {len(wins)} / ❌ {len(losses)} | винрейт {win_rate}")
+        lines.append("")
+        for t in with_pnl:
+            pnl = t.pnl() or 0.0
+            # на 1 контракт
+            n = getattr(t, "contracts", 1) or 1
+            per1 = pnl / n
+            pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
+            pct_str = f" ({pct:+.0f}%)" if pct is not None else ""
+            sign = "🟢" if pnl > 0 else "🔴"
+            lines.append(f"{sign} {t.option_type} ${per1:+.0f}{pct_str}")
+        if not with_pnl:
+            lines.append("Закрытых сделок за день нет.")
+        return "\n".join(lines)
+
+    # Полная версия (закрытый канал)
+    total_pnl = sum(t.pnl() for t in with_pnl) if with_pnl else 0.0
+    avg_pnl = total_pnl / len(with_pnl) if with_pnl else None
+    lines = [
+        f"📋 <b>Дневной отчёт QQQ — {today_str}</b>",
+        "",
+        f"Закрытых сделок: {len(closed)} (с P/L: {len(with_pnl)})",
+        f"Win/Loss: {len(wins)} / {len(losses)}  |  Win rate: {win_rate}",
+        f"Итоговый P/L: ${total_pnl:.2f}",
+        f"Средний P/L: {'${:.2f}'.format(avg_pnl) if avg_pnl is not None else 'n/a'}",
+    ]
+    if with_pnl:
+        lines.append("")
+        for t in with_pnl:
+            pnl = t.pnl() or 0.0
+            pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
+            pct_str = f" ({pct:+.0f}%)" if pct is not None else ""
+            sign = "🟢" if pnl > 0 else "🔴"
+            n = getattr(t, "contracts", 1) or 1
+            lines.append(f"{sign} {t.option_type} {n}× → ${pnl:+.2f}{pct_str}")
+    if not closed:
+        lines.append("")
+        lines.append("Сделок за дату нет или они ещё не закрыты.")
+    return "\n".join(lines)
+
+
+def build_day_report_public(app) -> str:
+    return build_day_report(app, public=True)

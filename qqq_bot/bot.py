@@ -156,7 +156,16 @@ async def _send_signal_to_channel(
                     label = br.cfg.label
                     if rec.action_type == "OPEN":
                         acct_val = br.purchasing_power() or 0.0
-                        contracts = br.calc_contracts(price, acct_val)
+                        # Размер берём из настроек чата (runtime), а не из статичного .env
+                        rs = getattr(app, "settings", None)
+                        if rs is not None:
+                            pct = min(rs.position_pct, br.cfg.max_position_pct) / 100.0
+                            budget = acct_val * pct
+                            per_contract = max(price * 100, 1e-9)
+                            contracts = int(budget // per_contract)
+                            contracts = max(0, min(contracts, int(rs.max_contracts)))
+                        else:
+                            contracts = br.calc_contracts(price, acct_val)
                         side = "BUY"
                     else:  # CLOSE
                         # Закрытие = продать то, что БЫЛО КУПЛЕНО при открытии.
@@ -280,6 +289,19 @@ async def _amain() -> None:
         app.strategy_id = cfg.strategy_id
         app.trade_journal = TradeJournal(cfg.cache_dir)
 
+        # Настройки из чата (стоп-лосс, размер позиции) — переживают рестарт.
+        # Дефолты берём из первого exec-аккаунта (если есть), иначе стандартные.
+        from .runtime_settings import RuntimeSettings, load_settings
+        _def = RuntimeSettings()
+        if cfg.executions:
+            _ex0 = cfg.executions[0]
+            _def = RuntimeSettings(
+                stop_loss_pct=0.0,
+                position_pct=_ex0.position_pct,
+                max_contracts=_ex0.max_contracts,
+            )
+        app.settings = load_settings(cfg.cache_dir, _def)
+
         # ML-сервис для консенсуса (advisory-режим: только вероятности, ничего не блокирует).
         # Изолировано: если модель не грузится — консенсус работает на #1 + #2.
         if cfg.consensus.enabled:
@@ -334,6 +356,37 @@ async def _amain() -> None:
                          extra_text=None, consensus_res=None) -> None:
             await _send_signal_to_channel(bot, app, decision, chart_path, df_sig, rec,
                                           session, extra_text, consensus_res)
+
+        # RTH-открытие: сводка настроек ТОЛЬКО в закрытый (основной) канал
+        async def on_rth_open():
+            try:
+                from .runtime_settings import format_settings
+                if getattr(app, "settings", None) is None:
+                    return
+                txt = "🔔 <b>Старт торговой сессии</b>\n\n" + format_settings(app.settings)
+                await bot.send_message(chat_id=app.cfg.telegram_channel_id, text=txt,
+                                       parse_mode=ParseMode.HTML)
+            except Exception as e:
+                app.stats.last_error = f"on_rth_open: {repr(e)}"
+
+        # RTH-закрытие: авто-dayreport в ОБА канала (полный/публичный)
+        async def on_rth_close():
+            try:
+                from .trades import build_day_report, build_day_report_public
+                # основной канал — полный отчёт
+                full = build_day_report(app)
+                await bot.send_message(chat_id=app.cfg.telegram_channel_id, text=full,
+                                       parse_mode=ParseMode.HTML)
+                # публичный канал — версия «на 1 контракт» ($ и %)
+                pub_id = getattr(app.cfg, "telegram_public_channel_id", 0)
+                if pub_id:
+                    pub = build_day_report_public(app)
+                    await bot.send_message(chat_id=pub_id, text=pub, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                app.stats.last_error = f"on_rth_close: {repr(e)}"
+
+        app.on_rth_open_cb = on_rth_open
+        app.on_rth_close_cb = on_rth_close
 
         asyncio.create_task(polling_loop(app, sender))
 
