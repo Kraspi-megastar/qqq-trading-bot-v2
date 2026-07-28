@@ -137,6 +137,10 @@ async def _send_signal_to_channel(
                     lines.append(html.escape(f"P&L сделки: {_pnl_str_for_public}"))
 
         # Применяем новую позицию
+        # Если позиция ЗАКРЫЛАСЬ (new_position=None при CLOSE) — разрешаем следующему
+        # сигналу того же направления поставить новый треугольник (повторный вход).
+        if rec.action_type == "CLOSE" and rec.new_position is None:
+            app._allow_reentry_mark = True
         app.option_position = rec.new_position
 
         lines += ["", format_option_message(rec)]

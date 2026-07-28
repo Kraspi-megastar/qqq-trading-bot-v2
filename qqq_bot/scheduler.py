@@ -191,6 +191,13 @@ def _record_signal(
     bar_ts_utc: datetime,
     price: float | None,
 ) -> None:
+    """
+    Записывает точку сигнала для отрисовки треугольника.
+    ВАЖНО: вызывать только на РЕАЛЬНОМ событии входа/разворота (открытие позиции
+    или флип направления), а НЕ на каждом баре, где сигнал сохраняется — иначе
+    рисуется гроздь треугольников. Дедупликация: тот же action на том же баре
+    не пишется дважды.
+    """
     try:
         hist = app.stats.signal_history
     except Exception:
@@ -203,13 +210,17 @@ def _record_signal(
         last = hist[-1]
         last_action = last[0] if isinstance(last, (tuple, list)) and len(last) >= 1 else None
         last_ts = last[1] if isinstance(last, (tuple, list)) and len(last) >= 2 else None
-        # Подавляем ТОЛЬКО настоящий дубль: то же действие на том же баре.
-        # Раньше подавлялось любое повторение действия (last_action == action),
-        # из-за чего терялись повторные входы в одном направлении (напр. после
-        # стопа BUY→BUY→BUY) — их треугольники не рисовались. Теперь рисуются.
+        # настоящий дубль: то же действие на том же баре
         if last_action == action and last_ts == bar_ts_utc:
             return
+        # то же направление, что и последний записанный треугольник → сигнал
+        # сохраняется (не новый вход). Не пишем, чтобы не было грозди на каждом
+        # баре. Новый треугольник появится только при СМЕНЕ направления (флип)
+        # или после сброса метки (напр. закрытие позиции по стопу — см. reset).
+        if last_action == action and not getattr(app, "_allow_reentry_mark", False):
+            return
 
+    app._allow_reentry_mark = False
     hist.append((action, bar_ts_utc, p))
 
     max_keep = 200
