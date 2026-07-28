@@ -24,6 +24,8 @@ _FILENAME = "runtime_settings.json"
 class RuntimeSettings:
     # Стоп-лосс: закрыть позицию, если она в минусе на >= этот % (0 = выключен)
     stop_loss_pct: float = 0.0
+    # После стопа не переоткрывать то же направление N минут (0 = переоткрывать сразу)
+    stop_cooldown_min: int = 15
     # Размер позиции: % от свободных денег
     position_pct: float = 5.0
     # Максимум контрактов на сделку
@@ -47,6 +49,7 @@ def load_settings(cache_dir, defaults: RuntimeSettings | None = None) -> Runtime
         data = json.loads(p.read_text(encoding="utf-8"))
         return RuntimeSettings(
             stop_loss_pct=float(data.get("stop_loss_pct", base.stop_loss_pct)),
+            stop_cooldown_min=int(data.get("stop_cooldown_min", base.stop_cooldown_min)),
             position_pct=float(data.get("position_pct", base.position_pct)),
             max_contracts=int(data.get("max_contracts", base.max_contracts)),
         )
@@ -73,9 +76,11 @@ def save_settings(cache_dir, settings: RuntimeSettings) -> bool:
 def format_settings(settings: RuntimeSettings) -> str:
     """Человекочитаемая сводка настроек."""
     stop = f"{settings.stop_loss_pct:.0f}%" if settings.stop_loss_pct > 0 else "выключен"
+    cd = f"{settings.stop_cooldown_min} мин" if settings.stop_cooldown_min > 0 else "нет"
     return (
         "⚙️ <b>Текущие настройки</b>\n"
         f"Стоп-лосс: {stop}\n"
+        f"Пауза после стопа: {cd}\n"
         f"Размер позиции: {settings.position_pct:.0f}% от свободных\n"
         f"Макс. контрактов: {settings.max_contracts}"
     )

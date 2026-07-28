@@ -273,7 +273,8 @@ async def cmd_options(message: Message, app: AppState) -> None:
                     underlying_price=last_price,
                     cfg=opt_cfg,
                     current_position=pos,
-                    market_open=True,    # в /options показываем как было бы в RTH
+                    can_open=True,     # в /options показываем как было бы в RTH
+                    can_close=True,
                     atr=atr_v,
                     tn=app.tn,
                 )
@@ -923,6 +924,30 @@ async def cmd_set_stop(message: Message, app: AppState) -> None:
     save_settings(app.cfg.cache_dir, s)
     stop = f"{val:.0f}%" if val > 0 else "выключен"
     await message.answer(f"✅ Стоп-лосс: {stop}\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_cooldown"))
+async def cmd_set_cooldown(message: Message, app: AppState) -> None:
+    """/set_cooldown 15 — пауза (мин) на переоткрытие того же направления после стопа. 0 = без паузы."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /set_cooldown 15  (минут, 0 = без паузы)")
+        return
+    try:
+        val = int(parts[1])
+    except ValueError:
+        await message.answer("Не понял число. Пример: /set_cooldown 15")
+        return
+    if val < 0 or val > 240:
+        await message.answer("Пауза должна быть 0–240 минут.")
+        return
+    s = _ensure_settings(app)
+    s.stop_cooldown_min = val
+    save_settings(app.cfg.cache_dir, s)
+    cd = f"{val} мин" if val > 0 else "без паузы"
+    await message.answer(f"✅ Пауза после стопа: {cd}\n\n{format_settings(s)}")
 
 
 @router.message(Command("set_contracts"))

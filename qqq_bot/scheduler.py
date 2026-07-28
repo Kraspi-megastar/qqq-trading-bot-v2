@@ -58,6 +58,11 @@ class AppState:
     last_signal_sent: str | None = None
     last_signal_sent_ts: object | None = None
 
+    # После выбивания по стопу — не переоткрывать ТО ЖЕ направление сразу
+    # (защита от «пилы»: сигнал #1 ещё активен и снова открыл бы убыточную сделку).
+    stop_cooldown_until: object | None = None   # datetime UTC, до которого блок
+    stop_cooldown_dir: str | None = None        # какое направление заблокировано (CALL/PUT)
+
     strategy_id: int = 1
     strategy2: Strategy2State = field(default_factory=Strategy2State)
     option_position: OptionPosition | None = None  # стратегия #1: открытая опционная позиция
@@ -198,9 +203,11 @@ def _record_signal(
         last = hist[-1]
         last_action = last[0] if isinstance(last, (tuple, list)) and len(last) >= 1 else None
         last_ts = last[1] if isinstance(last, (tuple, list)) and len(last) >= 2 else None
+        # Подавляем ТОЛЬКО настоящий дубль: то же действие на том же баре.
+        # Раньше подавлялось любое повторение действия (last_action == action),
+        # из-за чего терялись повторные входы в одном направлении (напр. после
+        # стопа BUY→BUY→BUY) — их треугольники не рисовались. Теперь рисуются.
         if last_action == action and last_ts == bar_ts_utc:
-            return
-        if last_action == action:
             return
 
     hist.append((action, bar_ts_utc, p))
@@ -714,6 +721,13 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                                             f"🛑 Стоп-лосс: позиция в минусе "
                                             f"{pnl_pct:.0f}% (порог −{stop_pct:.0f}%)"
                                         )
+                                        # Пауза на переоткрытие ТОГО ЖЕ направления,
+                                        # чтобы не встать сразу в ту же убыточную сделку.
+                                        cd_min = int(getattr(rs, "stop_cooldown_min", 0) or 0)
+                                        if cd_min > 0:
+                                            app.stop_cooldown_until = (
+                                                now + timedelta(minutes=cd_min))
+                                            app.stop_cooldown_dir = app.option_position.option_type
                         except Exception as e:
                             app.stats.last_error = f"stop_loss: {repr(e)}"
 
@@ -777,6 +791,19 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                     can_close = mh.can_close_option(
                         now, cfg.display_tz, ocfg.open_blackout_min, ocfg.close_blackout_min
                     )
+                    # Пауза после стопа: не переоткрывать ТО ЖЕ направление.
+                    # BUY→CALL, SELL→PUT. Если сигнал совпадает с заблокированным
+                    # направлением и пауза ещё активна — не открываем.
+                    if (app.stop_cooldown_until is not None
+                            and now < app.stop_cooldown_until):
+                        would_open = "CALL" if decision.action == "BUY" else (
+                            "PUT" if decision.action == "SELL" else None)
+                        if would_open and would_open == app.stop_cooldown_dir:
+                            can_open = False
+                    elif app.stop_cooldown_until is not None and now >= app.stop_cooldown_until:
+                        # пауза истекла — сбрасываем
+                        app.stop_cooldown_until = None
+                        app.stop_cooldown_dir = None
                     atr_v = None
                     try:
                         if len(df_sig) > 0 and "atr" in df_sig.columns:

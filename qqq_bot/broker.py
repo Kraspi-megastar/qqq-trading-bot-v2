@@ -62,7 +62,7 @@ class ExecutionConfig:
     max_contracts: int = 50            # абсолютный потолок контрактов
 
     # Предохранители
-    max_orders_per_day: int = 20       # лимит ордеров в день
+    max_orders_per_day: int = 0        # лимит ордеров в день (0 = без лимита)
     max_notional_per_trade: float = 50000.0  # макс. номинал одной сделки, $
 
     # 0DTE / overnight защита
@@ -105,6 +105,7 @@ class PendingOrder:
     is_open: bool
     created_ts: datetime
     human: str                         # текст для кнопки/сообщения
+    market: bool = False               # рыночный приказ (для стопов)
 
     def is_expired(self, now: datetime, timeout_sec: int) -> bool:
         return (now - self.created_ts).total_seconds() > timeout_sec
@@ -244,7 +245,8 @@ class Broker:
             return "исполнение недоступно (выключено/остановлено/нет клиента)"
 
         self._reset_daily_counter()
-        if self._orders_today >= self.cfg.max_orders_per_day:
+        # Дневной лимит ордеров: 0 = без лимита (по умолчанию отключён).
+        if self.cfg.max_orders_per_day > 0 and self._orders_today >= self.cfg.max_orders_per_day:
             return f"достигнут дневной лимит ордеров ({self.cfg.max_orders_per_day})"
 
         if contracts > self.cfg.max_contracts:
@@ -275,38 +277,46 @@ class Broker:
         tn_ticker: str,               # +QQQ.01JUL2026.C733
         side: str,                    # "BUY" | "SELL"
         contracts: int,
-        limit_price: float,           # цена опциона (лимит); 0 = рынок (НЕ рекомендуется)
+        limit_price: float,           # цена опциона (лимит); для рынка передаётся ориентир
         dte: Optional[int],
         is_open: bool,                # True = открытие, False = закрытие
         confirmed: bool = False,      # semi_auto: True только после подтверждения пользователем
+        market: bool = False,         # True = рыночный приказ (price=0), False = лимитный
     ) -> ExecResult:
         """
         Отправляет ордер на опцион. В semi_auto без confirmed=True — не отправляет,
         а возвращает pending_confirm.
+        market=True → рыночный приказ (быстрое исполнение, для стопов).
         """
-        notional = abs(limit_price) * contracts * 100  # 1 контракт = 100
+        # для оценки номинала/предохранителей используем limit_price как ориентир
+        ref_price = abs(limit_price) if limit_price else 0.0
+        notional = ref_price * contracts * 100  # 1 контракт = 100
 
         block = self._preflight(notional, contracts, dte, is_open)
         if block is not None:
             return ExecResult(ok=False, action="blocked", reason=block)
 
+        order_kind = "MKT" if market else f"@ {limit_price:.2f}"
+
         # semi_auto: требуем явное подтверждение
         if self.cfg.mode == "semi_auto" and not confirmed:
             return ExecResult(
                 ok=False, action="pending_confirm",
-                reason=f"{side} {contracts}× {tn_ticker} @ {limit_price:.2f} — требуется подтверждение",
+                reason=f"{side} {contracts}× {tn_ticker} {order_kind} — требуется подтверждение",
             )
 
         if self.cfg.mode == "off":
             return ExecResult(ok=False, action="blocked", reason="режим off")
 
         # Отправка через SDK. place_order: отрицательный qty = продажа.
+        # Рыночный приказ: price=0.0 (SDK трактует 0 как рынок).
         qty = contracts if side == "BUY" else -contracts
+        send_price = 0.0 if market else float(limit_price)
         try:
             resp = self._client.place_order(
                 symbol=tn_ticker,
                 quantity=qty,
-                price=float(limit_price),
+                price=send_price,
                 duration="day",
                 use_margin=False,       # опционы без маржи по умолчанию
             )
@@ -325,7 +335,7 @@ class Broker:
         self._orders_today += 1
         return ExecResult(
             ok=True, action="order_placed",
-            reason=f"{side} {contracts}× {tn_ticker} @ {limit_price:.2f}",
+            reason=f"{side} {contracts}× {tn_ticker} {order_kind}",
             order_id=int(order_id) if order_id else None, raw=resp if isinstance(resp, dict) else {},
         )
 
@@ -362,16 +372,18 @@ class Broker:
     def create_pending(
         self, *, tn_ticker: str, side: str, contracts: int,
         limit_price: float, dte: Optional[int], is_open: bool,
+        market: bool = False,
     ) -> PendingOrder:
         """Регистрирует ордер, ожидающий подтверждения. Возвращает PendingOrder с токеном."""
         import uuid
         token = uuid.uuid4().hex[:12]
         action_ru = "ОТКРЫТЬ" if is_open else "ЗАКРЫТЬ"
-        human = f"{action_ru} {side} {contracts}× {tn_ticker} @ {limit_price:.2f}"
+        price_part = "по рынку" if market else f"@ {limit_price:.2f}"
+        human = f"{action_ru} {side} {contracts}× {tn_ticker} {price_part}"
         po = PendingOrder(
             token=token, tn_ticker=tn_ticker, side=side, contracts=contracts,
             limit_price=limit_price, dte=dte, is_open=is_open,
-            created_ts=datetime.now(tz=timezone.utc), human=human,
+            created_ts=datetime.now(tz=timezone.utc), human=human, market=market,
         )
         self._pending[token] = po
         return po
@@ -408,7 +420,7 @@ class Broker:
         return self.place_option_order(
             tn_ticker=po.tn_ticker, side=po.side, contracts=po.contracts,
             limit_price=po.limit_price, dte=po.dte, is_open=po.is_open,
-            confirmed=True,
+            confirmed=True, market=getattr(po, "market", False),
         )
 
     def reject_pending(self, token: str) -> bool:

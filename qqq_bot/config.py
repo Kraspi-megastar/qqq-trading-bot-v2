@@ -83,7 +83,7 @@ class ExecutionConfig:
     position_pct: float = 5.0
     max_position_pct: float = 10.0
     max_contracts: int = 50
-    max_orders_per_day: int = 20
+    max_orders_per_day: int = 0
     max_notional_per_trade: float = 50000.0
     hold_overnight_min_dte: int = 99      # 99 = не держать ночь никогда
     block_new_position_if_dte_lte: int = 0
@@ -174,7 +174,7 @@ def _load_executions() -> tuple[ExecutionConfig, ...]:
             position_pct=float(g("POSITION_PCT", "EXEC_POSITION_PCT", "5.0")),
             max_position_pct=float(g("MAX_POSITION_PCT", "EXEC_MAX_POSITION_PCT", "10.0")),
             max_contracts=int(g("MAX_CONTRACTS", "EXEC_MAX_CONTRACTS", "50")),
-            max_orders_per_day=int(g("MAX_ORDERS_PER_DAY", "EXEC_MAX_ORDERS_PER_DAY", "20")),
+            max_orders_per_day=int(g("MAX_ORDERS_PER_DAY", "EXEC_MAX_ORDERS_PER_DAY", "0")),
             max_notional_per_trade=float(g("MAX_NOTIONAL", "EXEC_MAX_NOTIONAL", "50000")),
             hold_overnight_min_dte=int(g("HOLD_OVERNIGHT_MIN_DTE", "EXEC_HOLD_OVERNIGHT_MIN_DTE", "99")),
             block_new_position_if_dte_lte=int(g("BLOCK_NEW_IF_DTE_LTE", "EXEC_BLOCK_NEW_IF_DTE_LTE", "0")),

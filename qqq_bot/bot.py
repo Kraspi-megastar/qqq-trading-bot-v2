@@ -105,6 +105,7 @@ async def _send_signal_to_channel(
     lines += ["", f"<i>{html.escape(decision.reason)}</i>"]
 
     # ── Опционная часть ────────────────────────────────────────────────────
+    _pnl_str_for_public = None
     if rec is not None:
         now_utc = datetime.now(tz=timezone.utc)
         session_date = getattr(app.stats, "session_id", None) or now_utc.date().isoformat()
@@ -132,7 +133,8 @@ async def _send_signal_to_channel(
                     exit_ts=now_utc,
                 )
                 if closed is not None:
-                    lines.append(html.escape(f"P&L сделки: {closed.pnl_str()}"))
+                    _pnl_str_for_public = closed.pnl_str()
+                    lines.append(html.escape(f"P&L сделки: {_pnl_str_for_public}"))
 
         # Применяем новую позицию
         app.option_position = rec.new_position
@@ -189,9 +191,15 @@ async def _send_signal_to_channel(
                             continue
 
                     if contracts >= 1:
+                        # Стоп-лосс и принудительное закрытие в конце дня — РЫНОЧНЫМ
+                        # приказом (быстрое исполнение, лимитка может зависнуть пока
+                        # рынок уходит). Обычные закрытия/открытия — лимитные.
+                        use_market = (rec.action_type == "CLOSE"
+                                      and getattr(rec, "delta_source", "") in ("stop_loss", "force_close"))
                         po = br.create_pending(
                             tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
                             limit_price=price, dte=rec.dte, is_open=(rec.action_type == "OPEN"),
+                            market=use_market,
                         )
                         # callback data: exec_ok:{account_id}:{token}
                         from .handlers import build_account_confirm_row
@@ -224,7 +232,8 @@ async def _send_signal_to_channel(
     pub_id = getattr(app.cfg, "telegram_public_channel_id", 0)
     if pub_id:
         try:
-            pub_caption = _build_public_caption(app, decision, rec, consensus_res)
+            pub_caption = _build_public_caption(app, decision, rec, consensus_res,
+                                                pnl_str=_pnl_str_for_public)
             await bot.send_photo(
                 chat_id=pub_id,
                 photo=FSInputFile(chart_path),
@@ -236,10 +245,11 @@ async def _send_signal_to_channel(
 
 
 def _build_public_caption(app: AppState, decision: SignalDecision,
-                          rec: OptionRecommendation | None, consensus_res=None) -> str:
+                          rec: OptionRecommendation | None, consensus_res=None,
+                          pnl_str: str | None = None) -> str:
     """
     Компактное сообщение для публичного канала:
-    направление + опцион (с тикером DasTrader) + консенсус.
+    направление + опцион (с тикером DasTrader) + причина закрытия + P&L + консенсус.
     Без индикаторов, без исполнения, без служебных деталей.
     """
     from .options import format_option_message_public
@@ -256,6 +266,20 @@ def _build_public_caption(app: AppState, decision: SignalDecision,
     if rec is not None:
         base_symbol = str(getattr(app.cfg, "symbol", "QQQ")).split(".")[0].lower()
         parts.append(format_option_message_public(rec, symbol=base_symbol))
+
+        # Причина закрытия — человекочитаемо (для подписчиков)
+        if rec.action_type == "CLOSE":
+            reason = getattr(rec, "delta_source", "")
+            reason_txt = {
+                "stop_loss": "🛑 Закрытие по стоп-лоссу",
+                "force_close": "🔚 Закрытие в конце дня (позицию не переносим через ночь)",
+                "pending_close": "Закрытие (отложенное)",
+            }.get(reason, None)
+            if reason_txt:
+                parts.append(reason_txt)
+            # P&L результат сделки
+            if pnl_str:
+                parts.append(f"Результат: {pnl_str}")
 
     if consensus_res is not None:
         try:
