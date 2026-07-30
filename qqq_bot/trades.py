@@ -224,6 +224,24 @@ def build_day_report(app, public: bool = False) -> str:
         # показываем $ и %. Без абсолютных размеров позиции.
         lines = [f"📋 <b>Итоги дня — {today_str}</b>", ""]
         lines.append(f"Сделок: {len(with_pnl)} | ✅ {len(wins)} / ❌ {len(losses)} | винрейт {win_rate}")
+
+        # Суммарный результат за день В РАСЧЁТЕ НА 1 КОНТРАКТ и средняя доходность
+        if with_pnl:
+            total_per1 = 0.0
+            pct_list = []
+            for t in with_pnl:
+                n = getattr(t, "contracts", 1) or 1
+                total_per1 += (t.pnl() or 0.0) / n
+                pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
+                if pct is not None:
+                    pct_list.append(pct)
+            avg_pct = sum(pct_list) / len(pct_list) if pct_list else None
+            sign_tot = "🟢" if total_per1 >= 0 else "🔴"
+            lines.append("")
+            lines.append(f"{sign_tot} <b>Итог за день (на 1 контракт): ${total_per1:+.0f}</b>")
+            if avg_pct is not None:
+                lines.append(f"Средняя доходность по сделкам: {avg_pct:+.1f}%")
+
         lines.append("")
         for t in with_pnl:
             pnl = t.pnl() or 0.0

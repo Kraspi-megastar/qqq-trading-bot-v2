@@ -162,11 +162,20 @@ async def _send_signal_to_channel(
                     label = br.cfg.label
                     if rec.action_type == "OPEN":
                         acct_val = br.purchasing_power() or 0.0
-                        # Размер берём из настроек чата (runtime), а не из статичного .env
+                        # Размер берём из настроек чата (runtime), а не из статичного .env.
+                        # Настройка пользователя приоритетна; жёсткий потолок брокера
+                        # (max_position_pct) применяем только если он ВЫШЕ нуля и реально
+                        # ниже запрошенного — тогда сообщаем об этом явно.
                         rs = getattr(app, "settings", None)
+                        cap_note = ""
                         if rs is not None:
-                            pct = min(rs.position_pct, br.cfg.max_position_pct) / 100.0
-                            budget = acct_val * pct
+                            want_pct = float(rs.position_pct)
+                            hard_cap = float(getattr(br.cfg, "max_position_pct", 100.0) or 100.0)
+                            eff_pct = min(want_pct, hard_cap)
+                            if eff_pct < want_pct:
+                                cap_note = (f" (запрошено {want_pct:.0f}%, "
+                                            f"ограничено потолком {hard_cap:.0f}%)")
+                            budget = acct_val * (eff_pct / 100.0)
                             per_contract = max(price * 100, 1e-9)
                             contracts = int(budget // per_contract)
                             contracts = max(0, min(contracts, int(rs.max_contracts)))
@@ -211,7 +220,14 @@ async def _send_signal_to_channel(
                         lines += ["", f"🎯 <b>{label}</b>: {po.human}"]
                         any_offer = True
                     else:
-                        lines += ["", f"🎯 <b>{label}</b>: размер = 0 контрактов (мал % или баланс)"]
+                        # Подробная причина: сколько денег, почём контракт, какой %
+                        detail = ""
+                        if rec.action_type == "OPEN":
+                            per_c = price * 100
+                            detail = (f"\nБаланс ${acct_val:.0f}, контракт ~${per_c:.0f}"
+                                      f"{cap_note}")
+                        lines += ["", f"🎯 <b>{label}</b>: размер = 0 контрактов "
+                                      f"(бюджета не хватает на 1 контракт){detail}"]
 
                 if any_offer:
                     from aiogram.types import InlineKeyboardMarkup

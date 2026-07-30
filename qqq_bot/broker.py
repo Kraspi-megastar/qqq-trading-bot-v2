@@ -58,7 +58,7 @@ class ExecutionConfig:
 
     # Sizing
     position_pct: float = 5.0          # % от размера счёта на одну сделку
-    max_position_pct: float = 10.0     # жёсткий потолок % на сделку
+    max_position_pct: float = 100.0    # жёсткий потолок % на сделку (предохранитель от опечаток)
     max_contracts: int = 50            # абсолютный потолок контрактов
 
     # Предохранители

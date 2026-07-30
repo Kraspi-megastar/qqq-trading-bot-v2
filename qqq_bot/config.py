@@ -81,7 +81,7 @@ class ExecutionConfig:
     public_key: str = ""
     private_key: str = ""
     position_pct: float = 5.0
-    max_position_pct: float = 10.0
+    max_position_pct: float = 100.0
     max_contracts: int = 50
     max_orders_per_day: int = 0
     max_notional_per_trade: float = 50000.0
@@ -172,7 +172,7 @@ def _load_executions() -> tuple[ExecutionConfig, ...]:
             public_key=g("PUBLIC_KEY", "TRADERNET_PUBLIC_KEY", ""),
             private_key=g("PRIVATE_KEY", "TRADERNET_PRIVATE_KEY", ""),
             position_pct=float(g("POSITION_PCT", "EXEC_POSITION_PCT", "5.0")),
-            max_position_pct=float(g("MAX_POSITION_PCT", "EXEC_MAX_POSITION_PCT", "10.0")),
+            max_position_pct=float(g("MAX_POSITION_PCT", "EXEC_MAX_POSITION_PCT", "100.0")),
             max_contracts=int(g("MAX_CONTRACTS", "EXEC_MAX_CONTRACTS", "50")),
             max_orders_per_day=int(g("MAX_ORDERS_PER_DAY", "EXEC_MAX_ORDERS_PER_DAY", "0")),
             max_notional_per_trade=float(g("MAX_NOTIONAL", "EXEC_MAX_NOTIONAL", "50000")),
