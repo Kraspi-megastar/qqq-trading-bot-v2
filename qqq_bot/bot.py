@@ -506,11 +506,30 @@ async def _amain() -> None:
                 if pub_id:
                     pub = build_day_report_public(app)
                     await bot.send_message(chat_id=pub_id, text=pub, parse_mode=ParseMode.HTML)
+                # Бумажная #2 — итог дня (только в закрытый канал)
+                if getattr(app, "paper_s2_state", None) is not None and \
+                        getattr(app.settings, "paper_s2_on", False):
+                    try:
+                        from .paper_s2 import format_paper_day_summary
+                        await bot.send_message(chat_id=app.cfg.telegram_channel_id,
+                                               text=format_paper_day_summary(app.paper_s2_state),
+                                               parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
             except Exception as e:
                 app.stats.last_error = f"on_rth_close: {repr(e)}"
 
         app.on_rth_open_cb = on_rth_open
         app.on_rth_close_cb = on_rth_close
+
+        # Уведомление в закрытый канал (для фильтра тренда 1h, бумажной #2 и т.п.)
+        async def notify_closed(text: str):
+            try:
+                await bot.send_message(chat_id=app.cfg.telegram_channel_id, text=text,
+                                       parse_mode=ParseMode.HTML)
+            except Exception as e:
+                app.stats.last_error = f"notify_closed: {repr(e)}"
+        app.notify_closed_cb = notify_closed
 
         asyncio.create_task(polling_loop(app, sender))
 

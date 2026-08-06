@@ -30,6 +30,11 @@ class RuntimeSettings:
     position_pct: float = 5.0
     # Максимум контрактов на сделку
     max_contracts: int = 1
+    # Фильтр входов по тренду 1h: не открывать против тренда старшего ТФ
+    htf_filter_on: bool = False
+    htf_slope_threshold: float = 0.6
+    # Бумажная (виртуальная) стратегия #2 параллельно — только сигналы, без торговли
+    paper_s2_on: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,6 +57,9 @@ def load_settings(cache_dir, defaults: RuntimeSettings | None = None) -> Runtime
             stop_cooldown_min=int(data.get("stop_cooldown_min", base.stop_cooldown_min)),
             position_pct=float(data.get("position_pct", base.position_pct)),
             max_contracts=int(data.get("max_contracts", base.max_contracts)),
+            htf_filter_on=bool(data.get("htf_filter_on", base.htf_filter_on)),
+            htf_slope_threshold=float(data.get("htf_slope_threshold", base.htf_slope_threshold)),
+            paper_s2_on=bool(data.get("paper_s2_on", base.paper_s2_on)),
         )
     except Exception as e:
         logger.warning("runtime_settings load error: %s", repr(e))
@@ -77,10 +85,14 @@ def format_settings(settings: RuntimeSettings) -> str:
     """Человекочитаемая сводка настроек."""
     stop = f"{settings.stop_loss_pct:.0f}%" if settings.stop_loss_pct > 0 else "выключен"
     cd = f"{settings.stop_cooldown_min} мин" if settings.stop_cooldown_min > 0 else "нет"
+    htf = f"вкл (порог {settings.htf_slope_threshold:.1f})" if settings.htf_filter_on else "выкл"
+    paper = "вкл" if settings.paper_s2_on else "выкл"
     return (
         "⚙️ <b>Текущие настройки</b>\n"
         f"Стоп-лосс: {stop}\n"
         f"Пауза после стопа: {cd}\n"
         f"Размер позиции: {settings.position_pct:.0f}% от свободных\n"
-        f"Макс. контрактов: {settings.max_contracts}"
+        f"Макс. контрактов: {settings.max_contracts}\n"
+        f"Фильтр тренда 1h: {htf}\n"
+        f"Бумажная #2: {paper}"
     )

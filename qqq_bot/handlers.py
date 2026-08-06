@@ -994,3 +994,58 @@ async def cmd_set_pct(message: Message, app: AppState) -> None:
     s.position_pct = val
     save_settings(app.cfg.cache_dir, s)
     await message.answer(f"✅ Размер позиции: {val:.0f}% от свободных\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_htf_filter"))
+async def cmd_set_htf_filter(message: Message, app: AppState) -> None:
+    """/set_htf_filter on|off — фильтр входов по тренду 1h (не входить против тренда)."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or parts[1].lower() not in ("on", "off", "вкл", "выкл"):
+        await message.answer("Формат: /set_htf_filter on  (или off)")
+        return
+    val = parts[1].lower() in ("on", "вкл")
+    s = _ensure_settings(app)
+    s.htf_filter_on = val
+    save_settings(app.cfg.cache_dir, s)
+    await message.answer(f"✅ Фильтр тренда 1h: {'включён' if val else 'выключен'}\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_htf_slope"))
+async def cmd_set_htf_slope(message: Message, app: AppState) -> None:
+    """/set_htf_slope 0.6 — порог наклона EMA20 1h для определения тренда."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /set_htf_slope 0.6")
+        return
+    try:
+        val = float(parts[1].replace(",", "."))
+    except ValueError:
+        await message.answer("Не понял число. Пример: /set_htf_slope 0.6")
+        return
+    if val < 0 or val > 10:
+        await message.answer("Порог должен быть 0–10.")
+        return
+    s = _ensure_settings(app)
+    s.htf_slope_threshold = val
+    save_settings(app.cfg.cache_dir, s)
+    await message.answer(f"✅ Порог тренда 1h: {val:.1f}\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_paper_s2"))
+async def cmd_set_paper_s2(message: Message, app: AppState) -> None:
+    """/set_paper_s2 on|off — бумажная (виртуальная) стратегия #2 параллельно."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or parts[1].lower() not in ("on", "off", "вкл", "выкл"):
+        await message.answer("Формат: /set_paper_s2 on  (или off)")
+        return
+    val = parts[1].lower() in ("on", "вкл")
+    s = _ensure_settings(app)
+    s.paper_s2_on = val
+    save_settings(app.cfg.cache_dir, s)
+    await message.answer(f"✅ Бумажная #2: {'включена' if val else 'выключена'}\n\n{format_settings(s)}")

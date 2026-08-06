@@ -74,6 +74,7 @@ class AppState:
     broker: object | None = None                     # deprecated single broker (совместимость)
     brokers: list = field(default_factory=list)      # список Broker по счетам (ffa, tfos, ...)
     settings: object | None = None                   # RuntimeSettings (стоп-лосс, размер) — из чата
+    paper_s2_state: object | None = None             # PaperS2State — виртуальная #2 для обкатки
 
     def set_strategy(self, strategy_id: int) -> None:
         """
@@ -638,6 +639,42 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                     app.stats.last_error = f"consensus: {repr(e)}"
                     consensus_res = None
 
+            # 3.7) БУМАЖНАЯ #2 (виртуальная, для обкатки — не торгует).
+            #      Считает сигнал #2 каждый бар, ведёт виртуальную позицию с
+            #      RTH-правилами (окно + force-close), шлёт в закрытый канал.
+            rs_paper = getattr(app, "settings", None)
+            if (rs_paper is not None and getattr(rs_paper, "paper_s2_on", False)
+                    and rolled and len(df_sig) > 0):
+                try:
+                    from .paper_s2 import (PaperS2State, process_paper_signal,
+                                           reset_day_if_needed)
+                    if app.paper_s2_state is None:
+                        app.paper_s2_state = PaperS2State()
+                    pst = app.paper_s2_state
+                    sess_date = getattr(app.stats, "session_id", None) or now.date().isoformat()
+                    reset_day_if_needed(pst, sess_date)
+
+                    dec2p = compute_signal(df_sig, cfg.signal, strategy_id=2,
+                                           state=app.strategy2_for_consensus)
+                    if dec2p.new_state is not None:
+                        app.strategy2_for_consensus = dec2p.new_state
+
+                    ocfg_p = _option_cfg(cfg)
+                    force_p = mh.should_force_close(now, cfg.display_tz, ocfg_p.force_close_min)
+                    can_open_p = mh.can_open_option(
+                        now, cfg.display_tz, ocfg_p.open_blackout_min, ocfg_p.close_blackout_min)
+                    und = float(df_sig["close"].iloc[-1])
+                    ts_p = str(df_sig["ts"].iloc[-1])
+
+                    msg = process_paper_signal(pst, dec2p.action, und, ts_p,
+                                               can_open_p, force_p)
+                    if msg:
+                        cb = getattr(app, "notify_closed_cb", None)
+                        if cb is not None:
+                            await cb(msg)
+                except Exception as e:
+                    app.stats.last_error = f"paper_s2: {repr(e)}"
+
             # 4) Логируем каждое решение
             try:
                 sig_close: float | None = None
@@ -815,6 +852,27 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                         # пауза истекла — сбрасываем
                         app.stop_cooldown_until = None
                         app.stop_cooldown_dir = None
+
+                    # ФИЛЬТР ТРЕНДА 1h: не открывать против тренда старшего ТФ.
+                    # Стратегия #1 контртрендовая — против тренда 1h она теряет.
+                    rs = getattr(app, "settings", None)
+                    app._htf_blocked_msg = None
+                    if (rs is not None and getattr(rs, "htf_filter_on", False)
+                            and decision.action in ("BUY", "SELL") and can_open):
+                        try:
+                            from .htf_filter import compute_htf_trend, is_counter_trend, trend_label
+                            thr = float(getattr(rs, "htf_slope_threshold", 0.6))
+                            slope, _ = compute_htf_trend(df, ema_period=20, slope_hours=3)
+                            if is_counter_trend(decision.action, slope, thr):
+                                can_open = False
+                                lbl = trend_label(slope, thr)
+                                arrow = "BUY→CALL" if decision.action == "BUY" else "SELL→PUT"
+                                app._htf_blocked_msg = (
+                                    f"⚠️ Сигнал #1 {arrow} против тренда 1h "
+                                    f"({lbl}, наклон {slope:+.1f}) — вход пропущен"
+                                )
+                        except Exception as e:
+                            app.stats.last_error = f"htf_filter: {repr(e)}"
                     atr_v = None
                     try:
                         if len(df_sig) > 0 and "atr" in df_sig.columns:
@@ -868,6 +926,17 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                     # Фиксируем что обработали этот бар, но не шлём дубликат
                     app.last_signal_sent = decision.action
                     app.last_signal_sent_ts = sig_ts
+                    # Если вход был заблокирован фильтром тренда 1h — уведомляем
+                    # (в закрытый канал), чтобы было видно, что фильтр отработал.
+                    htf_msg = getattr(app, "_htf_blocked_msg", None)
+                    if htf_msg:
+                        cb = getattr(app, "notify_closed_cb", None)
+                        if cb is not None:
+                            try:
+                                await cb(htf_msg)
+                            except Exception:
+                                pass
+                        app._htf_blocked_msg = None
                 else:
                     active, _left = _cooldown_active(app)
                     if active and app.last_signal_sent == decision.action:
