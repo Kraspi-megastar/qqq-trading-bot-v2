@@ -510,9 +510,23 @@ async def _amain() -> None:
                 if getattr(app, "paper_s2_state", None) is not None and \
                         getattr(app.settings, "paper_s2_on", False):
                     try:
-                        from .paper_s2 import format_paper_day_summary
+                        from .paper_s2 import format_paper_day_summary, process_paper_signal
+                        pst = app.paper_s2_state
+                        # если к концу дня осталась открытая виртуальная позиция —
+                        # закрываем её по последней цене ДО подсчёта итога, иначе
+                        # сделка не попадёт в статистику дня.
+                        if pst.position is not None:
+                            last_price = None
+                            try:
+                                if len(app.cache) > 0:
+                                    last_price = float(app.cache.to_list()[-1].get("close"))
+                            except Exception:
+                                last_price = pst.position.get("entry_underlying")
+                            if last_price:
+                                process_paper_signal(pst, "HOLD", last_price,
+                                                     "", can_open=False, force_close=True)
                         await bot.send_message(chat_id=app.cfg.telegram_channel_id,
-                                               text=format_paper_day_summary(app.paper_s2_state),
+                                               text=format_paper_day_summary(pst),
                                                parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
