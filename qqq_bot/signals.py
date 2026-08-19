@@ -29,7 +29,7 @@ from .config import SignalConfig
 
 @dataclass
 class Strategy2State:
-    position: str = "FLAT"          # "FLAT" | "LONG"
+    position: str = "FLAT"          # "FLAT" | "LONG" | "SHORT"
     entry_price: Optional[float] = None
     atr_stop: Optional[float] = None
     entry_ts: Any = None             # datetime | None
@@ -53,6 +53,10 @@ class SignalDecision:
 
 def _cross_up(prev_a: float, prev_b: float, a: float, b: float) -> bool:
     return (prev_a <= prev_b) and (a > b)
+
+
+def _cross_down(prev_a: float, prev_b: float, a: float, b: float) -> bool:
+    return (prev_a >= prev_b) and (a < b)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -172,26 +176,40 @@ def _compute_strategy_2(
     atr_stop = state.atr_stop
 
     macd_cross_up = _cross_up(prev_macd_v, prev_macd_sig, macd_v, macd_sig)
+    macd_cross_down = _cross_down(prev_macd_v, prev_macd_sig, macd_v, macd_sig)
     above_vwap    = close > vwap_v   if pd.notna(vwap_v)  else False
+    below_vwap    = close < vwap_v   if pd.notna(vwap_v)  else False
     rsi_ok        = rsi_v > 50.0     if pd.notna(rsi_v)   else False
+    rsi_ok_short  = rsi_v < 50.0     if pd.notna(rsi_v)   else False
     st_up         = (st_dir == 1)
+    st_down       = (st_dir == -1)
     trend_ok      = close > ema200   if pd.notna(ema200)  else True
+    trend_ok_short = close < ema200  if pd.notna(ema200)  else True
 
     vol_filter_enabled = (pd.notna(vol_ma) and vol_ma > 0 and vol > 0)
     vol_ok = (vol > vol_ma) if vol_filter_enabled else True
 
     stop_mult = float(getattr(cfg, "atr_stop_mult", 3.0))
     new_stop_candidate = (close - stop_mult * atr_v) if (pd.notna(atr_v) and atr_v > 0) else None
+    # для шорта стоп ВЫШЕ цены (зеркально)
+    new_stop_candidate_short = (close + stop_mult * atr_v) if (pd.notna(atr_v) and atr_v > 0) else None
 
-    # trailing stop: только растёт (protect profits)
+    # trailing stop: для LONG только растёт, для SHORT только опускается (protect profits)
     if pos == "LONG" and atr_stop is not None and new_stop_candidate is not None:
         new_atr_stop = max(float(atr_stop), float(new_stop_candidate))
+    elif pos == "SHORT" and atr_stop is not None and new_stop_candidate_short is not None:
+        new_atr_stop = min(float(atr_stop), float(new_stop_candidate_short))
+    elif pos == "SHORT":
+        new_atr_stop = float(new_stop_candidate_short) if new_stop_candidate_short is not None else None
     else:
         new_atr_stop = float(new_stop_candidate) if new_stop_candidate is not None else None
 
-    # exit условия
+    # exit условия LONG
     macd_zero_exit = (prev_macd_v >= 0.0) and (macd_v < 0.0)
     atr_exit = (pos == "LONG") and (new_atr_stop is not None) and (close < new_atr_stop)
+    # exit условия SHORT (зеркально): MACD пересёк ноль ВВЕРХ, или цена выше стопа
+    macd_zero_exit_short = (prev_macd_v <= 0.0) and (macd_v > 0.0)
+    atr_exit_short = (pos == "SHORT") and (new_atr_stop is not None) and (close > new_atr_stop)
 
     details = {
         "strategy":      2,
@@ -202,7 +220,9 @@ def _compute_strategy_2(
         "macd":          macd_v,
         "macd_signal":   macd_sig,
         "macd_cross_up": macd_cross_up,
+        "macd_cross_down": macd_cross_down,
         "above_vwap":    above_vwap,
+        "below_vwap":    below_vwap,
         "rsi_ok":        rsi_ok,
         "supertrend_dir":st_dir,
         "st_up":         st_up,
@@ -218,39 +238,48 @@ def _compute_strategy_2(
         "atr_stop_mult": stop_mult,
     }
 
-    # EXIT
+    # EXIT LONG
     if pos == "LONG" and (macd_zero_exit or atr_exit):
         new_state = Strategy2State(
-            position="FLAT",
-            entry_price=None,
-            atr_stop=None,
-            entry_ts=None,
+            position="FLAT", entry_price=None, atr_stop=None, entry_ts=None,
         )
-        return SignalDecision("SELL", "STR#2 EXIT: macd_zero_exit or ATR-stop", details, new_state)
+        return SignalDecision("SELL", "STR#2 EXIT LONG: macd_zero_exit or ATR-stop", details, new_state)
 
-    # ENTRY
-    entry_ok = macd_cross_up and above_vwap and rsi_ok and st_up and vol_ok and trend_ok
-    if pos != "LONG" and entry_ok:
+    # EXIT SHORT (зеркально): закрытие шорта — это BUY (откупаем)
+    if pos == "SHORT" and (macd_zero_exit_short or atr_exit_short):
         new_state = Strategy2State(
-            position="LONG",
-            entry_price=close,
-            atr_stop=new_atr_stop,
-            entry_ts=bar_ts,
+            position="FLAT", entry_price=None, atr_stop=None, entry_ts=None,
+        )
+        return SignalDecision("BUY", "STR#2 EXIT SHORT: macd_zero_exit or ATR-stop", details, new_state)
+
+    # ENTRY LONG
+    entry_ok = macd_cross_up and above_vwap and rsi_ok and st_up and vol_ok and trend_ok
+    if pos == "FLAT" and entry_ok:
+        new_state = Strategy2State(
+            position="LONG", entry_price=close, atr_stop=new_atr_stop, entry_ts=bar_ts,
         )
         return SignalDecision(
-            "BUY",
-            "STR#2 BUY: MACD↑ + close>VWAP + RSI>50 + ST↑ + filters OK",
-            details,
-            new_state,
+            "BUY", "STR#2 BUY: MACD↑ + close>VWAP + RSI>50 + ST↑ + filters OK",
+            details, new_state,
+        )
+
+    # ENTRY SHORT (зеркально): открытие шорта — это SELL (→ PUT)
+    entry_ok_short = (macd_cross_down and below_vwap and rsi_ok_short
+                      and st_down and vol_ok and trend_ok_short)
+    if pos == "FLAT" and entry_ok_short:
+        new_state = Strategy2State(
+            position="SHORT", entry_price=close, atr_stop=new_atr_stop, entry_ts=bar_ts,
+        )
+        return SignalDecision(
+            "SELL", "STR#2 SELL: MACD↓ + close<VWAP + RSI<50 + ST↓ + filters OK",
+            details, new_state,
         )
 
     # HOLD — обновляем trailing stop в new_state если в позиции
-    if pos == "LONG" and new_atr_stop is not None:
+    if pos in ("LONG", "SHORT") and new_atr_stop is not None:
         updated = Strategy2State(
-            position=state.position,
-            entry_price=state.entry_price,
-            atr_stop=new_atr_stop,
-            entry_ts=state.entry_ts,
+            position=state.position, entry_price=state.entry_price,
+            atr_stop=new_atr_stop, entry_ts=state.entry_ts,
         )
         return SignalDecision("HOLD", "STR#2 HOLD", details, updated)
 
