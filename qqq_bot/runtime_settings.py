@@ -32,7 +32,9 @@ class RuntimeSettings:
     max_contracts: int = 1
     # Фильтр входов по тренду 1h: не открывать против тренда старшего ТФ
     htf_filter_on: bool = False
-    htf_slope_threshold: float = 0.6
+    htf_slope_threshold: float = 0.45
+    # Режимный роутер #1↔#2: боковик→#1 (контртренд), тренд→#2 (трендследящая)
+    router_on: bool = False
     # Бумажная (виртуальная) стратегия #2 параллельно — только сигналы, без торговли
     paper_s2_on: bool = False
 
@@ -59,6 +61,7 @@ def load_settings(cache_dir, defaults: RuntimeSettings | None = None) -> Runtime
             max_contracts=int(data.get("max_contracts", base.max_contracts)),
             htf_filter_on=bool(data.get("htf_filter_on", base.htf_filter_on)),
             htf_slope_threshold=float(data.get("htf_slope_threshold", base.htf_slope_threshold)),
+            router_on=bool(data.get("router_on", base.router_on)),
             paper_s2_on=bool(data.get("paper_s2_on", base.paper_s2_on)),
         )
     except Exception as e:
@@ -85,7 +88,8 @@ def format_settings(settings: RuntimeSettings) -> str:
     """Человекочитаемая сводка настроек."""
     stop = f"{settings.stop_loss_pct:.0f}%" if settings.stop_loss_pct > 0 else "выключен"
     cd = f"{settings.stop_cooldown_min} мин" if settings.stop_cooldown_min > 0 else "нет"
-    htf = f"вкл (порог {settings.htf_slope_threshold:.1f})" if settings.htf_filter_on else "выкл"
+    htf = f"вкл (порог {settings.htf_slope_threshold:.2f})" if settings.htf_filter_on else "выкл"
+    router = "вкл" if settings.router_on else "выкл"
     paper = "вкл" if settings.paper_s2_on else "выкл"
     return (
         "⚙️ <b>Текущие настройки</b>\n"
@@ -94,5 +98,6 @@ def format_settings(settings: RuntimeSettings) -> str:
         f"Размер позиции: {settings.position_pct:.0f}% от свободных\n"
         f"Макс. контрактов: {settings.max_contracts}\n"
         f"Фильтр тренда 1h: {htf}\n"
+        f"Режимный роутер #1↔#2: {router}\n"
         f"Бумажная #2: {paper}"
     )

@@ -75,6 +75,10 @@ class AppState:
     brokers: list = field(default_factory=list)      # список Broker по счетам (ffa, tfos, ...)
     settings: object | None = None                   # RuntimeSettings (стоп-лосс, размер) — из чата
     paper_s2_state: object | None = None             # PaperS2State — виртуальная #2 для обкатки
+    _router_active_strat: int | None = None          # активная стратегия по роутеру (1/2)
+    _router_prev_strat: int | None = None            # предыдущая — для детекта смены режима
+    _router_regime: str | None = None                # "trend"/"range"
+    _router_slope: float | None = None               # наклон 1h
 
     def set_strategy(self, strategy_id: int) -> None:
         """
@@ -564,18 +568,51 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
             df_sig = pd.DataFrame()
 
             # 3) Сигнал только по ЗАКРЫТЫМ барам (исключаем формирующийся)
+            app._router_active_strat = None
+            app._router_msg = None
             if len(df) >= 2:
                 df_sig = df.iloc[:-1].copy() if session_open else df.copy()
                 df_sig = add_indicators(df_sig, cfg)
                 if len(df_sig) > 0:
+                    # РЕЖИМНЫЙ РОУТЕР: боковик→#1, тренд→#2 (по тренду 1h).
+                    # Решает, какая стратегия активна для НОВЫХ входов.
+                    active_sid = app.strategy_id
+                    rs_router = getattr(app, "settings", None)
+                    if rs_router is not None and getattr(rs_router, "router_on", False):
+                        try:
+                            from .regime_router import decide_regime, active_strategy
+                            thr = float(getattr(rs_router, "htf_slope_threshold", 0.45))
+                            regime, slope = decide_regime(df_sig, thr)
+                            active_sid = active_strategy(regime)
+                            app._router_active_strat = active_sid
+                            app._router_regime = regime
+                            app._router_slope = slope
+                        except Exception as e:
+                            app.stats.last_error = f"router: {repr(e)}"
+                            active_sid = app.strategy_id
+
                     decision = compute_signal(
                         df_sig,
                         cfg.signal,
-                        strategy_id=app.strategy_id,
+                        strategy_id=active_sid,
                         state=app.strategy2,
                     )
                     # Применяем новое состояние стратегии #2 (чистая функция)
                     _apply_new_state(app, decision)
+
+                    # Уведомление о смене режима роутера (в закрытый канал)
+                    if app._router_active_strat is not None:
+                        prev = getattr(app, "_router_prev_strat", None)
+                        if prev is not None and prev != app._router_active_strat:
+                            try:
+                                from .regime_router import regime_label
+                                lbl = regime_label(app._router_regime, app._router_slope)
+                                cb = getattr(app, "notify_closed_cb", None)
+                                if cb is not None:
+                                    await cb(f"🔀 Смена режима: {lbl}")
+                            except Exception:
+                                pass
+                        app._router_prev_strat = app._router_active_strat
 
             # 3.5) КОНСЕНСУС: считаем все три источника при смене бара.
             #      #1 и #2 считаются всегда (независимо от активной стратегии),
@@ -855,13 +892,17 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
 
                     # ФИЛЬТР ТРЕНДА 1h: не открывать против тренда старшего ТФ.
                     # Стратегия #1 контртрендовая — против тренда 1h она теряет.
+                    # Если РОУТЕР включён — он сам управляет режимом (боковик→#1,
+                    # тренд→#2), поэтому отдельный фильтр #1 не нужен и пропускается.
                     rs = getattr(app, "settings", None)
                     app._htf_blocked_msg = None
-                    if (rs is not None and getattr(rs, "htf_filter_on", False)
+                    router_on = rs is not None and getattr(rs, "router_on", False)
+                    if (rs is not None and not router_on
+                            and getattr(rs, "htf_filter_on", False)
                             and decision.action in ("BUY", "SELL") and can_open):
                         try:
                             from .htf_filter import compute_htf_trend, is_counter_trend, trend_label
-                            thr = float(getattr(rs, "htf_slope_threshold", 0.6))
+                            thr = float(getattr(rs, "htf_slope_threshold", 0.45))
                             slope, _ = compute_htf_trend(df, ema_period=20, slope_hours=3)
                             if is_counter_trend(decision.action, slope, thr):
                                 can_open = False

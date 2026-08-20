@@ -1049,3 +1049,32 @@ async def cmd_set_paper_s2(message: Message, app: AppState) -> None:
     s.paper_s2_on = val
     save_settings(app.cfg.cache_dir, s)
     await message.answer(f"✅ Бумажная #2: {'включена' if val else 'выключена'}\n\n{format_settings(s)}")
+
+
+@router.message(Command("set_router"))
+async def cmd_set_router(message: Message, app: AppState) -> None:
+    """/set_router on|off — режимный роутер #1↔#2 (боковик→#1, тренд→#2 по тренду 1h)."""
+    if not _is_owner_private(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or parts[1].lower() not in ("on", "off", "вкл", "выкл"):
+        await message.answer(
+            "Формат: /set_router on  (или off)\n\n"
+            "Роутер выбирает стратегию по тренду 1h:\n"
+            "• боковик (|наклон| ≤ порог) → #1 (контртрендовая)\n"
+            "• тренд (|наклон| > порог) → #2 (трендследящая)\n"
+            "Порог задаётся через /set_htf_slope (сейчас общий для обеих)."
+        )
+        return
+    val = parts[1].lower() in ("on", "вкл")
+    s = _ensure_settings(app)
+    s.router_on = val
+    save_settings(app.cfg.cache_dir, s)
+    extra = ""
+    if val:
+        extra = ("\n\n⚠️ ВНИМАНИЕ: в тренде роутер откроет реальную позицию по #2 "
+                 "(единый риск-контур: тот же размер/стоп). #2 ранее только "
+                 "тестировалась. Риск ограничен твоими настройками размера.")
+    await message.answer(
+        f"✅ Режимный роутер #1↔#2: {'включён' if val else 'выключен'}{extra}\n\n{format_settings(s)}"
+    )
