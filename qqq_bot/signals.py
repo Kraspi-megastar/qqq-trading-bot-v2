@@ -33,6 +33,7 @@ class Strategy2State:
     entry_price: Optional[float] = None
     atr_stop: Optional[float] = None
     entry_ts: Any = None             # datetime | None
+    bars_held: int = 0               # сколько баров держим позицию (мин. холд от whipsaw)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -204,11 +205,13 @@ def _compute_strategy_2(
     else:
         new_atr_stop = float(new_stop_candidate) if new_stop_candidate is not None else None
 
-    # exit условия LONG
-    macd_zero_exit = (prev_macd_v >= 0.0) and (macd_v < 0.0)
+    # exit условия LONG: обратное пересечение сигнальной линии (симметрично входу)
+    # ИЛИ ATR-стоп. Раньше выход был по пересечению НУЛЯ — несимметрично входу
+    # (вход по сигналу), что давало whipsaw когда MACD колеблется у нуля.
+    macd_exit_long = _cross_down(prev_macd_v, prev_macd_sig, macd_v, macd_sig)
     atr_exit = (pos == "LONG") and (new_atr_stop is not None) and (close < new_atr_stop)
-    # exit условия SHORT (зеркально): MACD пересёк ноль ВВЕРХ, или цена выше стопа
-    macd_zero_exit_short = (prev_macd_v <= 0.0) and (macd_v > 0.0)
+    # exit условия SHORT (зеркально): MACD пересёк сигнал ВВЕРХ, или ATR-стоп
+    macd_exit_short = _cross_up(prev_macd_v, prev_macd_sig, macd_v, macd_sig)
     atr_exit_short = (pos == "SHORT") and (new_atr_stop is not None) and (close > new_atr_stop)
 
     details = {
@@ -233,53 +236,69 @@ def _compute_strategy_2(
         "vol_ok":        vol_ok,
         "atr":           atr_v,
         "atr_stop":      new_atr_stop,
-        "macd_zero_exit":macd_zero_exit,
+        "macd_exit_long":macd_exit_long,
         "atr_exit":      atr_exit,
         "atr_stop_mult": stop_mult,
     }
 
+    # Минимальный холд: не выходить по сигналу первые N баров после входа
+    # (защита от whipsaw когда MACD дёргается сразу после входа). ATR-стоп —
+    # это реальный риск, он работает всегда, минимальный холд его не блокирует.
+    MIN_HOLD_BARS = 3
+    held = int(getattr(state, "bars_held", 0))
+    hold_ok = held >= MIN_HOLD_BARS
+
     # EXIT LONG
-    if pos == "LONG" and (macd_zero_exit or atr_exit):
+    if pos == "LONG" and ((macd_exit_long and hold_ok) or atr_exit):
         new_state = Strategy2State(
-            position="FLAT", entry_price=None, atr_stop=None, entry_ts=None,
+            position="FLAT", entry_price=None, atr_stop=None, entry_ts=None, bars_held=0,
         )
-        return SignalDecision("SELL", "STR#2 EXIT LONG: macd_zero_exit or ATR-stop", details, new_state)
+        return SignalDecision("SELL", "STR#2 EXIT LONG: MACD↓ сигнал or ATR-stop", details, new_state)
 
     # EXIT SHORT (зеркально): закрытие шорта — это BUY (откупаем)
-    if pos == "SHORT" and (macd_zero_exit_short or atr_exit_short):
+    if pos == "SHORT" and ((macd_exit_short and hold_ok) or atr_exit_short):
         new_state = Strategy2State(
-            position="FLAT", entry_price=None, atr_stop=None, entry_ts=None,
+            position="FLAT", entry_price=None, atr_stop=None, entry_ts=None, bars_held=0,
         )
-        return SignalDecision("BUY", "STR#2 EXIT SHORT: macd_zero_exit or ATR-stop", details, new_state)
+        return SignalDecision("BUY", "STR#2 EXIT SHORT: MACD↑ сигнал or ATR-stop", details, new_state)
 
     # ENTRY LONG
-    entry_ok = macd_cross_up and above_vwap and rsi_ok and st_up and vol_ok and trend_ok
+    # Добавлено подтверждение направления MACD: для LONG вход только когда
+    # MACD выше нуля (реальный бычий импульс), а не просто пересёк сигнал у нуля.
+    # Это устраняет whipsaw когда MACD колеблется около нулевой линии.
+    macd_bullish = macd_v > 0.0
+    macd_bearish = macd_v < 0.0
+    entry_ok = (macd_cross_up and macd_bullish and above_vwap and rsi_ok
+                and st_up and vol_ok and trend_ok)
     if pos == "FLAT" and entry_ok:
         new_state = Strategy2State(
-            position="LONG", entry_price=close, atr_stop=new_atr_stop, entry_ts=bar_ts,
+            position="LONG", entry_price=close, atr_stop=new_atr_stop,
+            entry_ts=bar_ts, bars_held=0,
         )
         return SignalDecision(
-            "BUY", "STR#2 BUY: MACD↑ + close>VWAP + RSI>50 + ST↑ + filters OK",
+            "BUY", "STR#2 BUY: MACD↑>0 + close>VWAP + RSI>50 + ST↑ + filters OK",
             details, new_state,
         )
 
-    # ENTRY SHORT (зеркально): открытие шорта — это SELL (→ PUT)
-    entry_ok_short = (macd_cross_down and below_vwap and rsi_ok_short
+    # ENTRY SHORT (зеркально): вход только когда MACD НИЖЕ нуля (реальный медвежий импульс)
+    entry_ok_short = (macd_cross_down and macd_bearish and below_vwap and rsi_ok_short
                       and st_down and vol_ok and trend_ok_short)
     if pos == "FLAT" and entry_ok_short:
         new_state = Strategy2State(
-            position="SHORT", entry_price=close, atr_stop=new_atr_stop, entry_ts=bar_ts,
+            position="SHORT", entry_price=close, atr_stop=new_atr_stop,
+            entry_ts=bar_ts, bars_held=0,
         )
         return SignalDecision(
             "SELL", "STR#2 SELL: MACD↓ + close<VWAP + RSI<50 + ST↓ + filters OK",
             details, new_state,
         )
 
-    # HOLD — обновляем trailing stop в new_state если в позиции
-    if pos in ("LONG", "SHORT") and new_atr_stop is not None:
+    # HOLD — обновляем trailing stop и СЧЁТЧИК удержания в new_state
+    if pos in ("LONG", "SHORT"):
         updated = Strategy2State(
             position=state.position, entry_price=state.entry_price,
-            atr_stop=new_atr_stop, entry_ts=state.entry_ts,
+            atr_stop=new_atr_stop if new_atr_stop is not None else state.atr_stop,
+            entry_ts=state.entry_ts, bars_held=held + 1,
         )
         return SignalDecision("HOLD", "STR#2 HOLD", details, updated)
 
