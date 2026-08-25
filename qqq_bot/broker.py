@@ -427,6 +427,78 @@ class Broker:
         """Отклоняет ожидающий ордер (пользователь нажал Отмена)."""
         return self._pending.pop(token, None) is not None
 
+    # ── Аварийный выход ──────────────────────────────────────────────────────
+    def list_open_option_positions(self) -> list[dict]:
+        """
+        Открытые ОПЦИОННЫЕ позиции для аварийного закрытия.
+        Возвращает список {ticker, qty} с ненулевым количеством.
+        """
+        out = []
+        for p in self.get_positions():
+            try:
+                ticker = str(p.get("i", "")).strip()
+                qty = int(p.get("q", 0) or 0)
+                if ticker and qty != 0:
+                    out.append({"ticker": ticker, "qty": qty,
+                                "mkt": p.get("mkt_price", p.get("market_value"))})
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    def emergency_close_all(self) -> list[ExecResult]:
+        """
+        АВАРИЙНЫЙ ВЫХОД: продать по РЫНКУ все открытые опционные позиции счёта.
+        Обходит semi_auto-подтверждение и дневные лимиты (это осознанное ручное
+        решение оператора). Закрытие опциона всегда SELL (и CALL, и PUT
+        открывались через BUY). Возвращает результат по каждой позиции.
+        """
+        results: list[ExecResult] = []
+        if self._client is None:
+            return [ExecResult(ok=False, action="error", reason="нет клиента брокера")]
+        if self._halted:
+            return [ExecResult(ok=False, action="error", reason="стоп-кран (halt) активен")]
+
+        positions = self.list_open_option_positions()
+        if not positions:
+            return [ExecResult(ok=False, action="noop", reason="нет открытых позиций")]
+
+        for pos in positions:
+            ticker = pos["ticker"]
+            raw_qty = int(pos["qty"])
+            if raw_qty == 0:
+                continue
+            # Закрытие по знаку позиции: лонг (qty>0) → SELL (-qty),
+            # шорт (qty<0) → BUY (+|qty|). Бот обычно только лонг-опционы,
+            # но поддержим обе стороны на случай нестандартной позиции.
+            close_qty = -raw_qty            # противоположный знак закрывает позицию
+            qty = abs(raw_qty)
+            side_txt = "SELL" if raw_qty > 0 else "BUY"
+            try:
+                resp = self._client.place_order(
+                    symbol=ticker, quantity=close_qty, price=0.0,   # price=0 → рынок
+                    duration="day", use_margin=False,
+                )
+            except Exception as e:
+                results.append(ExecResult(ok=False, action="error",
+                                          reason=f"{ticker}: SDK exception {e!r}"))
+                continue
+            if isinstance(resp, dict) and resp.get("error"):
+                results.append(ExecResult(ok=False, action="error",
+                                          reason=f"{ticker}: {str(resp['error']).strip()}", raw=resp))
+                continue
+            order_id = None
+            if isinstance(resp, dict):
+                order_id = (resp.get("order_id") or resp.get("id")
+                            or resp.get("result", {}).get("order_id"))
+            self._orders_today += 1
+            results.append(ExecResult(
+                ok=True, action="order_placed",
+                reason=f"АВАРИЙНОЕ ЗАКРЫТИЕ {side_txt} {qty}× {ticker} MKT",
+                order_id=int(order_id) if order_id else None,
+                raw=resp if isinstance(resp, dict) else {},
+            ))
+        return results
+
 
 
     def calc_contracts(self, option_price: float, account_value: float) -> int:

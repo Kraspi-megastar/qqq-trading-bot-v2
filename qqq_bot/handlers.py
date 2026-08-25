@@ -1069,3 +1069,163 @@ async def cmd_set_router(message: Message, app: AppState) -> None:
     await message.answer(
         f"✅ Режимный роутер #1↔#2: {'включён' if val else 'выключен'}{extra}\n\n{format_settings(s)}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# АВАРИЙНЫЙ ВЫХОД (/panic) — ручное закрытие всех позиций по рынку.
+# Двухшаговый: /panic показывает счета с позициями → выбор счёта (или «все»)
+# → финальное подтверждение → продажа всего по рынку. Без 5-мин тайм-аута
+# (это осознанное ручное решение оператора), но с явным подтверждением.
+# ─────────────────────────────────────────────────────────────────────────────
+import secrets as _secrets
+
+# токены аварийных подтверждений: token -> account_id ("ALL" = все счета)
+_PANIC_TOKENS: dict[str, str] = {}
+
+
+@router.message(Command("panic"))
+async def cmd_panic(message: Message, app: AppState) -> None:
+    """/panic — аварийное закрытие позиций по рынку (с выбором счёта)."""
+    if not _is_owner_private(message):
+        return
+    brokers = [b for b in (getattr(app, "brokers", []) or []) if b.available]
+    if not brokers:
+        await message.answer("Нет доступных брокеров для аварийного выхода.")
+        return
+
+    # соберём счета с открытыми позициями
+    lines = ["🚨 <b>АВАРИЙНЫЙ ВЫХОД</b>", "",
+             "Закрытие ВСЕХ позиций выбранного счёта по РЫНКУ.", ""]
+    kb_rows = []
+    any_pos = False
+    for b in brokers:
+        try:
+            positions = b.list_open_option_positions()
+        except Exception as e:
+            positions = []
+            lines.append(f"[{b.cfg.label}] ошибка чтения позиций: {html.escape(str(e))}")
+        if positions:
+            any_pos = True
+            lines.append(f"<b>[{b.cfg.label}]</b> — {len(positions)} поз.:")
+            for p in positions:
+                lines.append(f"  • {p['ticker']} q={p['qty']}")
+            token = _secrets.token_hex(4)
+            _PANIC_TOKENS[token] = b.cfg.account_id
+            kb_rows.append([InlineKeyboardButton(
+                text=f"🔴 Закрыть [{b.cfg.label}]",
+                callback_data=f"panic_ask:{b.cfg.account_id}:{token}")])
+        else:
+            lines.append(f"[{b.cfg.label}] — нет открытых позиций")
+        lines.append("")
+
+    if not any_pos:
+        await message.answer("Открытых позиций нет ни на одном счёте — закрывать нечего.")
+        return
+
+    # кнопка «все счета сразу»
+    all_token = _secrets.token_hex(4)
+    _PANIC_TOKENS[all_token] = "ALL"
+    kb_rows.append([InlineKeyboardButton(
+        text="🔴🔴 Закрыть ВСЕ счета",
+        callback_data=f"panic_ask:ALL:{all_token}")])
+
+    await message.answer("\n".join(lines),
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data.startswith("panic_ask:"))
+async def cb_panic_ask(cq: CallbackQuery, app: AppState) -> None:
+    """Шаг 2: запрос финального подтверждения по выбранному счёту/всем."""
+    if cq.from_user is None or int(cq.from_user.id) != OWNER_USER_ID:
+        await cq.answer("Недоступно", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    if len(parts) < 3:
+        await cq.answer("Ошибка", show_alert=True); return
+    account_id, token = parts[1], parts[2]
+    if _PANIC_TOKENS.get(token) != account_id:
+        await cq.answer("Токен истёк, повтори /panic", show_alert=True); return
+
+    label = "ВСЕ СЧЕТА" if account_id == "ALL" else account_id
+    if account_id != "ALL":
+        br = _find_broker(app, account_id)
+        label = br.cfg.label if br else account_id
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ ДА, продать по рынку",
+                             callback_data=f"panic_go:{account_id}:{token}"),
+        InlineKeyboardButton(text="❌ Отмена",
+                             callback_data=f"panic_cancel:{token}"),
+    ]])
+    await cq.answer()
+    try:
+        await cq.message.edit_text(
+            cq.message.html_text +
+            f"\n\n⚠️ Подтверди аварийное закрытие: <b>[{label}]</b> по рынку?",
+            parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await cq.message.answer(f"Подтверди закрытие [{label}]?", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("panic_go:"))
+async def cb_panic_go(cq: CallbackQuery, app: AppState) -> None:
+    """Шаг 3: исполнение аварийного закрытия."""
+    if cq.from_user is None or int(cq.from_user.id) != OWNER_USER_ID:
+        await cq.answer("Недоступно", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    if len(parts) < 3:
+        await cq.answer("Ошибка", show_alert=True); return
+    account_id, token = parts[1], parts[2]
+    if _PANIC_TOKENS.get(token) != account_id:
+        await cq.answer("Токен истёк, повтори /panic", show_alert=True); return
+    _PANIC_TOKENS.pop(token, None)  # одноразовый
+
+    if account_id == "ALL":
+        targets = [b for b in (getattr(app, "brokers", []) or []) if b.available]
+    else:
+        br = _find_broker(app, account_id)
+        targets = [br] if br is not None else []
+
+    if not targets:
+        await cq.answer("Счёт не найден", show_alert=True); return
+
+    await cq.answer("Исполняю аварийный выход…")
+    report = ["🚨 <b>АВАРИЙНЫЙ ВЫХОД — результат</b>", ""]
+    for b in targets:
+        report.append(f"<b>[{b.cfg.label}]</b>")
+        try:
+            results = b.emergency_close_all()
+        except Exception as e:
+            report.append(f"  ❌ ошибка: {html.escape(str(e))}")
+            report.append("")
+            continue
+        for r in results:
+            if r.ok:
+                oid = f" (order_id {r.order_id})" if r.order_id else ""
+                report.append(f"  ✅ {html.escape(r.reason)}{oid}")
+            elif r.action == "noop":
+                report.append(f"  — {html.escape(r.reason)}")
+            else:
+                report.append(f"  ❌ {html.escape(r.reason)}")
+        report.append("")
+    report.append("Проверь фактические позиции: /positions")
+    try:
+        await cq.message.edit_text("\n".join(report), parse_mode="HTML")
+    except Exception:
+        await cq.message.answer("\n".join(report), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("panic_cancel:"))
+async def cb_panic_cancel(cq: CallbackQuery, app: AppState) -> None:
+    """Отмена аварийного закрытия."""
+    parts = cq.data.split(":")
+    if len(parts) >= 2:
+        _PANIC_TOKENS.pop(parts[1], None)
+    await cq.answer("Отменено")
+    try:
+        await cq.message.edit_text(
+            cq.message.html_text + "\n\n❌ <b>Аварийный выход отменён</b>",
+            parse_mode="HTML")
+    except Exception:
+        pass
