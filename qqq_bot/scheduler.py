@@ -28,10 +28,8 @@ from .config import AppConfig
 from .models import Bar
 from .pipeline import bars_to_df, add_indicators, min_bars_for_indicators
 from .signals import compute_signal, SignalDecision, Strategy2State
-from .consensus import (
-    ConsensusState, ConsensusConfig, compute_consensus,
-    signal_to_vote, ml_to_vote, format_consensus, format_conflict_warning,
-)
+# Консенсус и ML удалены при чистке — они не влияли на торговлю (advisory-only).
+# Стратегия #2 / роутер / бумажная #2 сохранены в коде, но выключены по умолчанию.
 from .options import OptionPosition, OptionConfig, get_option_recommendation, build_close_recommendation
 from .trades import TradeJournal
 from . import market_hours as mh
@@ -68,9 +66,7 @@ class AppState:
     option_position: OptionPosition | None = None  # стратегия #1: открытая опционная позиция
     pending_close: str | None = None                # "BUY"/"SELL" сигнал, ждущий окна закрытия
     trade_journal: TradeJournal | None = None       # журнал опционных сделок
-    consensus_state: ConsensusState = field(default_factory=ConsensusState)
-    ml_service: object | None = None                 # MLTradingService | None (advisory)
-    strategy2_for_consensus: Strategy2State = field(default_factory=Strategy2State)  # #2 считается всегда
+    strategy2_for_consensus: Strategy2State = field(default_factory=Strategy2State)  # #2 (для скрытой paper-обкатки)
     broker: object | None = None                     # deprecated single broker (совместимость)
     brokers: list = field(default_factory=list)      # список Broker по счетам (ffa, tfos, ...)
     settings: object | None = None                   # RuntimeSettings (стоп-лосс, размер) — из чата
@@ -614,67 +610,9 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                                 pass
                         app._router_prev_strat = app._router_active_strat
 
-            # 3.5) КОНСЕНСУС: считаем все три источника при смене бара.
-            #      #1 и #2 считаются всегда (независимо от активной стратегии),
-            #      ML — advisory-режим (только вероятности, ничего не блокирует).
+            # 3.5) Консенсус-голосование удалено при чистке (advisory-only, не влиял
+            #      на торговлю). Сигнал теперь чистый: #1 + фильтр тренда 1h.
             consensus_res = None
-            if getattr(cfg, "consensus", None) and cfg.consensus.enabled and rolled and len(df_sig) > 0:
-                try:
-                    app.consensus_state.tick()
-
-                    # #1 всегда
-                    dec1 = compute_signal(df_sig, cfg.signal, strategy_id=1)
-                    if dec1.action in ("BUY", "SELL"):
-                        app.consensus_state.set_vote(
-                            "s1", signal_to_vote(dec1.action),
-                            f"score={dec1.details.get('buy_score', dec1.details.get('sell_score', '?'))}"
-                        )
-
-                    # #2 в консенсусе: НЕПРЕРЫВНАЯ оценка режима (голос каждый бар),
-                    # а не редкий точечный вход. Считаем по 4 индикаторам
-                    # (VWAP, MACD, Supertrend, RSI), голос при >=3 согласных из 4.
-                    try:
-                        from .consensus import strategy2_regime_vote
-                        s2_vote, s2_detail = strategy2_regime_vote(
-                            df_sig.iloc[-1], min_agree=3
-                        )
-                        if s2_vote != 0:
-                            app.consensus_state.set_vote("s2", s2_vote, s2_detail)
-                        else:
-                            # режим стал нейтральным — сбрасываем старый голос #2,
-                            # чтобы он не висел 12 баров (это непрерывный источник)
-                            app.consensus_state.clear_vote("s2")
-                    except Exception as e:
-                        app.stats.last_error = f"s2_regime: {repr(e)}"
-
-                    # ML advisory — берём СЫРЫЕ вероятности модели, независимо от
-                    # действия стратегии #1. decide() зануляет вероятности при
-                    # base_signal=HOLD / вне сессии, что нам НЕ нужно для консенсуса:
-                    # ML должен голосовать своим мнением каждый бар.
-                    if app.ml_service is not None and getattr(app.ml_service, "predictor", None) is not None:
-                        try:
-                            pred = app.ml_service.predictor.predict_latest(
-                                df_sig.rename(columns={"ts": "timestamp"}),
-                                strategy_context={
-                                    "symbol": cfg.symbol,
-                                    "timeframe_minutes": cfg.timeframe_minutes,
-                                    "strategy_id": app.strategy_id,
-                                },
-                            )
-                            long_p = float(pred.get("long_prob", 0.5))
-                            short_p = float(pred.get("short_prob", 0.5))
-                            mlv, mld = ml_to_vote(long_p, short_p, cfg.consensus.ml_min_edge)
-                            if mlv != 0:
-                                app.consensus_state.set_vote("ml", mlv, mld)
-                            else:
-                                app.consensus_state.clear_vote("ml")
-                        except Exception as e:
-                            app.stats.last_error = f"ml_predict: {repr(e)}"
-
-                    consensus_res = compute_consensus(app.consensus_state, cfg.consensus)
-                except Exception as e:
-                    app.stats.last_error = f"consensus: {repr(e)}"
-                    consensus_res = None
 
             # 3.7) БУМАЖНАЯ #2 (виртуальная, для обкатки — не торгует).
             #      Считает сигнал #2 каждый бар, ведёт виртуальную позицию с
@@ -1013,12 +951,9 @@ async def polling_loop(app: AppState, send_signal_cb) -> None:
                             signal_chart_path = chart_path
 
                         try:
-                            # Консенсус-разбивка при сигнале #1 (или активной стратегии)
-                            consensus_text = None
-                            if consensus_res is not None:
-                                consensus_text = format_consensus(consensus_res)
+                            # Консенсус удалён — сигнал отправляется без блока голосования.
                             await send_signal_cb(decision, str(signal_chart_path), df_sig, rec,
-                                                 consensus_text, consensus_res)
+                                                 None, None)
                             try:
                                 app.persist_state(now)
                             except Exception as e:

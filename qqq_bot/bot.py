@@ -333,7 +333,6 @@ async def _setup_command_menus(bot, app) -> None:
     full = _cmds([
         ("help", "Список команд"),
         ("status", "Состояние бота и сессия"),
-        ("consensus", "Консенсус источников"),
         ("chart", "График с сигналами"),
         ("last", "Последний сигнал"),
         ("options", "Текущая опционная позиция"),
@@ -343,10 +342,9 @@ async def _setup_command_menus(bot, app) -> None:
         ("set_stop", "Стоп-лосс: /set_stop 30"),
         ("set_pct", "Размер позиции: /set_pct 5"),
         ("set_contracts", "Макс контрактов: /set_contracts 2"),
-        ("set_router", "Роутер #1↔#2: /set_router on"),
         ("set_htf_filter", "Фильтр тренда 1h: /set_htf_filter on"),
         ("set_htf_slope", "Порог тренда: /set_htf_slope 0.45"),
-        ("set_paper_s2", "Бумажная #2: /set_paper_s2 on"),
+        ("set_cooldown", "Пауза после стопа: /set_cooldown 15"),
         ("account", "Балансы по счетам"),
         ("positions", "Открытые позиции"),
         ("orders", "Активные ордера"),
@@ -361,7 +359,6 @@ async def _setup_command_menus(bot, app) -> None:
     info = _cmds([
         ("help", "Список команд"),
         ("status", "Состояние бота"),
-        ("consensus", "Консенсус источников"),
         ("chart", "График с сигналами"),
         ("last", "Последний сигнал"),
         ("options", "Текущая позиция"),
@@ -430,21 +427,7 @@ async def _amain() -> None:
             )
         app.settings = load_settings(cfg.cache_dir, _def)
 
-        # ML-сервис для консенсуса (advisory-режим: только вероятности, ничего не блокирует).
-        # Изолировано: если модель не грузится — консенсус работает на #1 + #2.
-        if cfg.consensus.enabled:
-            try:
-                from .ml.service import MLTradingService
-                import os as _os
-                _os.environ.setdefault("ML_ENABLED", "1")
-                _os.environ.setdefault("ML_MODE", "advisory")
-                app.ml_service = MLTradingService.from_env()
-                if getattr(app.ml_service, "predictor", None) is None:
-                    app.stats.last_error = f"ML не загружен: {getattr(app.ml_service, 'load_error', 'n/a')}"
-                    app.ml_service = None
-            except Exception as e:
-                app.stats.last_error = f"ML init: {repr(e)}"
-                app.ml_service = None
+        # ML-сервис удалён при чистке (advisory-only, не влиял на торговлю).
 
         # Брокеры по счетам (ffa, tfos, ...). По умолчанию всё выключено.
         # Изолировано: ошибка инициализации не влияет на сигнальную работу.
