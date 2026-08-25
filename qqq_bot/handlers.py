@@ -1229,3 +1229,158 @@ async def cb_panic_cancel(cq: CallbackQuery, app: AppState) -> None:
             parse_mode="HTML")
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ОТМЕНА ВСЕХ АКТИВНЫХ ОРДЕРОВ (/cancelall) — снять висящие лимитки/стопы.
+# Тот же двухшаговый флоу с выбором счёта, что у /panic.
+# Отдельно от /panic: закрытие позиций и отмена ордеров — разные действия.
+# ─────────────────────────────────────────────────────────────────────────────
+# токены отмены ордеров: token -> account_id ("ALL" = все счета)
+_CANCEL_TOKENS: dict[str, str] = {}
+
+
+@router.message(Command("cancelall"))
+async def cmd_cancelall(message: Message, app: AppState) -> None:
+    """/cancelall — отменить все активные ордера (с выбором счёта)."""
+    if not _is_owner_private(message):
+        return
+    brokers = [b for b in (getattr(app, "brokers", []) or []) if b.available]
+    if not brokers:
+        await message.answer("Нет доступных брокеров.")
+        return
+
+    lines = ["🧹 <b>ОТМЕНА ВСЕХ ОРДЕРОВ</b>", "",
+             "Снятие ВСЕХ активных приказов выбранного счёта.", ""]
+    kb_rows = []
+    any_orders = False
+    for b in brokers:
+        try:
+            orders = b.get_active_orders()
+        except Exception as e:
+            orders = []
+            lines.append(f"[{b.cfg.label}] ошибка чтения ордеров: {html.escape(str(e))}")
+        if orders:
+            any_orders = True
+            lines.append(f"<b>[{b.cfg.label}]</b> — {len(orders)} активн.:")
+            for o in orders:
+                instr = o.get("instr", "?")
+                oid = o.get("order_id") or o.get("id") or "?"
+                lines.append(f"  • {instr} (id {oid})")
+            token = _secrets.token_hex(4)
+            _CANCEL_TOKENS[token] = b.cfg.account_id
+            kb_rows.append([InlineKeyboardButton(
+                text=f"🧹 Отменить ордера [{b.cfg.label}]",
+                callback_data=f"cancel_ask:{b.cfg.account_id}:{token}")])
+        else:
+            lines.append(f"[{b.cfg.label}] — нет активных ордеров")
+        lines.append("")
+
+    if not any_orders:
+        await message.answer("Активных ордеров нет ни на одном счёте — отменять нечего.")
+        return
+
+    all_token = _secrets.token_hex(4)
+    _CANCEL_TOKENS[all_token] = "ALL"
+    kb_rows.append([InlineKeyboardButton(
+        text="🧹🧹 Отменить ордера на ВСЕХ счетах",
+        callback_data=f"cancel_ask:ALL:{all_token}")])
+
+    await message.answer("\n".join(lines),
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data.startswith("cancel_ask:"))
+async def cb_cancel_ask(cq: CallbackQuery, app: AppState) -> None:
+    """Шаг 2: подтверждение отмены ордеров по выбранному счёту/всем."""
+    if cq.from_user is None or int(cq.from_user.id) != OWNER_USER_ID:
+        await cq.answer("Недоступно", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    if len(parts) < 3:
+        await cq.answer("Ошибка", show_alert=True); return
+    account_id, token = parts[1], parts[2]
+    if _CANCEL_TOKENS.get(token) != account_id:
+        await cq.answer("Токен истёк, повтори /cancelall", show_alert=True); return
+
+    label = "ВСЕ СЧЕТА" if account_id == "ALL" else account_id
+    if account_id != "ALL":
+        br = _find_broker(app, account_id)
+        label = br.cfg.label if br else account_id
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ ДА, отменить ордера",
+                             callback_data=f"cancel_go:{account_id}:{token}"),
+        InlineKeyboardButton(text="❌ Отмена",
+                             callback_data=f"cancel_no:{token}"),
+    ]])
+    await cq.answer()
+    try:
+        await cq.message.edit_text(
+            cq.message.html_text +
+            f"\n\n⚠️ Отменить все ордера: <b>[{label}]</b>?",
+            parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await cq.message.answer(f"Отменить ордера [{label}]?", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("cancel_go:"))
+async def cb_cancel_go(cq: CallbackQuery, app: AppState) -> None:
+    """Шаг 3: исполнение отмены ордеров."""
+    if cq.from_user is None or int(cq.from_user.id) != OWNER_USER_ID:
+        await cq.answer("Недоступно", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    if len(parts) < 3:
+        await cq.answer("Ошибка", show_alert=True); return
+    account_id, token = parts[1], parts[2]
+    if _CANCEL_TOKENS.get(token) != account_id:
+        await cq.answer("Токен истёк, повтори /cancelall", show_alert=True); return
+    _CANCEL_TOKENS.pop(token, None)
+
+    if account_id == "ALL":
+        targets = [b for b in (getattr(app, "brokers", []) or []) if b.available]
+    else:
+        br = _find_broker(app, account_id)
+        targets = [br] if br is not None else []
+    if not targets:
+        await cq.answer("Счёт не найден", show_alert=True); return
+
+    await cq.answer("Отменяю ордера…")
+    report = ["🧹 <b>ОТМЕНА ОРДЕРОВ — результат</b>", ""]
+    for b in targets:
+        report.append(f"<b>[{b.cfg.label}]</b>")
+        try:
+            results = b.cancel_all_orders()
+        except Exception as e:
+            report.append(f"  ❌ ошибка: {html.escape(str(e))}")
+            report.append("")
+            continue
+        for r in results:
+            if r.ok:
+                report.append(f"  ✅ {html.escape(r.reason)}")
+            elif r.action == "noop":
+                report.append(f"  — {html.escape(r.reason)}")
+            else:
+                report.append(f"  ❌ {html.escape(r.reason)}")
+        report.append("")
+    report.append("Проверь активные ордера: /orders")
+    try:
+        await cq.message.edit_text("\n".join(report), parse_mode="HTML")
+    except Exception:
+        await cq.message.answer("\n".join(report), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("cancel_no:"))
+async def cb_cancel_no(cq: CallbackQuery, app: AppState) -> None:
+    """Отмена операции снятия ордеров."""
+    parts = cq.data.split(":")
+    if len(parts) >= 2:
+        _CANCEL_TOKENS.pop(parts[1], None)
+    await cq.answer("Отменено")
+    try:
+        await cq.message.edit_text(
+            cq.message.html_text + "\n\n❌ <b>Снятие ордеров отменено</b>",
+            parse_mode="HTML")
+    except Exception:
+        pass

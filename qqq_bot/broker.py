@@ -367,6 +367,34 @@ class Broker:
                           reason=str(resp.get("error", "unknown")).strip() if isinstance(resp, dict) else "unknown",
                           raw=resp if isinstance(resp, dict) else {})
 
+    def cancel_all_orders(self) -> list[ExecResult]:
+        """
+        АВАРИЙНАЯ отмена ВСЕХ активных ордеров счёта (висящие лимитки/стопы).
+        Перебирает get_active_orders() и отменяет каждый. Возвращает результат
+        по каждому ордеру. Пустой список активных → один noop.
+        """
+        if self._client is None:
+            return [ExecResult(ok=False, action="error", reason="нет клиента брокера")]
+        active = self.get_active_orders()
+        if not active:
+            return [ExecResult(ok=False, action="noop", reason="нет активных ордеров")]
+        results: list[ExecResult] = []
+        for o in active:
+            oid = o.get("order_id") or o.get("id")
+            instr = str(o.get("instr", "")).strip()
+            if oid is None:
+                results.append(ExecResult(ok=False, action="error",
+                                          reason=f"ордер без id ({instr or '?'})"))
+                continue
+            res = self.cancel_order(int(oid))
+            # обогатим сообщение тикером для читаемости отчёта
+            if instr and res.reason:
+                res = ExecResult(ok=res.ok, action=res.action,
+                                 reason=f"{instr}: {res.reason}",
+                                 order_id=res.order_id, raw=res.raw)
+            results.append(res)
+        return results
+
     # ── Semi-auto: ожидающие подтверждения ордера ────────────────────────────
 
     def create_pending(
