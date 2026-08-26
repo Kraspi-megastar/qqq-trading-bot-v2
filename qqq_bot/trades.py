@@ -39,6 +39,9 @@ class TradeRecord:
     exit_ts: Optional[str] = None
     contracts: int = 1                  # количество контрактов
     status: str = "open"                # open | closed
+    account_id: str = "signal"          # счёт исполнения (ffa/tfos/...) или "signal" (сигнальный уровень)
+    entry_order_id: Optional[int] = None  # id ордера входа у брокера
+    exit_order_id: Optional[int] = None   # id ордера выхода у брокера
 
     def pnl(self) -> Optional[float]:
         """P&L в долларах. 1 контракт = 100 акций."""
@@ -136,6 +139,8 @@ class TradeJournal:
         entry_underlying: float,
         entry_ts: datetime,
         contracts: int = 1,
+        account_id: str = "signal",
+        entry_order_id: Optional[int] = None,
     ) -> TradeRecord:
         trade = TradeRecord(
             trade_id=str(uuid.uuid4())[:8],
@@ -150,6 +155,8 @@ class TradeJournal:
             entry_ts=entry_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             contracts=contracts,
             status="open",
+            account_id=account_id,
+            entry_order_id=entry_order_id,
         )
         self._append(trade)
         return trade
@@ -161,15 +168,19 @@ class TradeJournal:
         exit_price: Optional[float],
         exit_underlying: float,
         exit_ts: datetime,
+        account_id: str = "signal",
+        exit_order_id: Optional[int] = None,
     ) -> Optional[TradeRecord]:
-        """Закрывает последнюю открытую сделку с данным тикером."""
+        """Закрывает последнюю открытую сделку с данным тикером НА ДАННОМ СЧЁТЕ."""
         for i in range(len(self._trades) - 1, -1, -1):
             t = self._trades[i]
-            if t.ticker == ticker and t.status == "open":
+            if (t.ticker == ticker and t.status == "open"
+                    and getattr(t, "account_id", "signal") == account_id):
                 t.exit_price = exit_price
                 t.exit_underlying = exit_underlying
                 t.exit_ts = exit_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 t.status = "closed"
+                t.exit_order_id = exit_order_id
                 self._append(t)
                 return t
         return None
@@ -186,16 +197,32 @@ class TradeJournal:
                 return t
         return None
 
-    def closed_trades(self, session_date: Optional[str] = None, limit: int = 20) -> list[TradeRecord]:
+    def closed_trades(self, session_date: Optional[str] = None, limit: int = 20,
+                      account_id: Optional[str] = None) -> list[TradeRecord]:
         result = [t for t in self._trades if t.status == "closed"]
         if session_date:
             result = [t for t in result if t.session_date == session_date]
+        if account_id is not None:
+            result = [t for t in result if getattr(t, "account_id", "signal") == account_id]
         return result[-limit:]
 
-    def all_trades(self, session_date: Optional[str] = None) -> list[TradeRecord]:
+    def all_trades(self, session_date: Optional[str] = None,
+                   account_id: Optional[str] = None) -> list[TradeRecord]:
+        result = list(self._trades)
         if session_date:
-            return [t for t in self._trades if t.session_date == session_date]
-        return list(self._trades)
+            result = [t for t in result if t.session_date == session_date]
+        if account_id is not None:
+            result = [t for t in result if getattr(t, "account_id", "signal") == account_id]
+        return result
+
+    def accounts_seen(self) -> list[str]:
+        """Список счетов, встречающихся в журнале (кроме сигнального уровня)."""
+        seen = []
+        for t in self._trades:
+            acc = getattr(t, "account_id", "signal")
+            if acc not in seen:
+                seen.append(acc)
+        return seen
 
 
 def build_day_report(app, public: bool = False) -> str:
@@ -284,3 +311,83 @@ def build_day_report(app, public: bool = False) -> str:
 
 def build_day_report_public(app) -> str:
     return build_day_report(app, public=True)
+
+
+def build_account_stats(app, session_date: Optional[str] = None) -> str:
+    """
+    Статистика P&L по КАЖДОМУ СЧЁТУ отдельно (реальные сделки).
+    session_date=None → за всю историю; иначе за конкретный день.
+    """
+    import html as _html
+
+    if app.trade_journal is None:
+        return "Журнал сделок недоступен."
+
+    journal = app.trade_journal
+    # какие счета реально исполняли (исключаем сигнальный уровень)
+    accounts = [a for a in journal.accounts_seen() if a != "signal"]
+
+    period = session_date if session_date else "вся история"
+    lines = [f"📊 <b>Статистика по счетам — {period}</b>", ""]
+
+    if not accounts:
+        lines.append("Реальных сделок по счетам пока нет.")
+        lines.append("")
+        lines.append("<i>Сделки исполняются при подтверждении ордера на счёте. "
+                     "Как только пройдут реальные сделки — здесь появится разбивка "
+                     "P&L по каждому счёту (FFA, TFOS и т.д.).</i>")
+        return "\n".join(lines)
+
+    grand_pnl = 0.0
+    grand_n = 0
+    for acc in accounts:
+        closed = journal.closed_trades(session_date=session_date, limit=1000, account_id=acc)
+        with_pnl = [t for t in closed if t.pnl() is not None]
+        if not with_pnl:
+            lines.append(f"<b>[{acc}]</b> — закрытых сделок нет")
+            lines.append("")
+            continue
+        wins = [t for t in with_pnl if (t.pnl() or 0) > 0]
+        losses = [t for t in with_pnl if (t.pnl() or 0) <= 0]
+        total = sum(t.pnl() or 0.0 for t in with_pnl)
+        wr = len(wins) / len(with_pnl) * 100 if with_pnl else 0
+        avg = total / len(with_pnl) if with_pnl else 0
+        avg_win = (sum(t.pnl() or 0 for t in wins) / len(wins)) if wins else 0
+        avg_loss = (sum(t.pnl() or 0 for t in losses) / len(losses)) if losses else 0
+        grand_pnl += total
+        grand_n += len(with_pnl)
+        sign = "🟢" if total >= 0 else "🔴"
+        lines.append(f"{sign} <b>[{acc}]</b>")
+        lines.append(f"  P&L: ${total:+.0f} | сделок {len(with_pnl)} | винрейт {wr:.0f}%")
+        lines.append(f"  ✅ {len(wins)} (ср. ${avg_win:+.0f}) / ❌ {len(losses)} (ср. ${avg_loss:+.0f})")
+        lines.append(f"  ср. сделка: ${avg:+.1f}")
+        lines.append("")
+
+    if len(accounts) > 1 and grand_n > 0:
+        gsign = "🟢" if grand_pnl >= 0 else "🔴"
+        lines.append(f"{gsign} <b>ИТОГО по всем счетам: ${grand_pnl:+.0f}</b> ({grand_n} сделок)")
+
+    return "\n".join(lines)
+
+
+def parse_tn_ticker(tn_ticker: str) -> Optional[dict]:
+    """
+    Разбирает тикер TraderNet '+QQQ.28AUG2026.C710' на компоненты.
+    Возвращает {option_type, strike, expiry(date)} или None при неудаче.
+    """
+    from datetime import datetime as _dt
+    try:
+        s = tn_ticker.lstrip("+")
+        parts = s.split(".")
+        if len(parts) < 3:
+            return None
+        # parts[-1] = C710 / P705 ; parts[-2] = 28AUG2026
+        cp = parts[-1]
+        opt = "CALL" if cp[0].upper() == "C" else ("PUT" if cp[0].upper() == "P" else None)
+        if opt is None:
+            return None
+        strike = float(cp[1:])
+        expiry = _dt.strptime(parts[-2], "%d%b%Y").date()
+        return {"option_type": opt, "strike": strike, "expiry": expiry}
+    except Exception:
+        return None

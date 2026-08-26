@@ -354,6 +354,7 @@ async def _setup_command_menus(bot, app) -> None:
         ("panic", "🚨 Аварийный выход (закрыть по рынку)"),
         ("cancelall", "🧹 Отменить все ордера по счёту"),
         ("stats", "Статистика"),
+        ("accstats", "P&L по счетам: /accstats [today]"),
         ("ping", "Проверка отклика"),
     ])
 

@@ -384,6 +384,29 @@ async def cmd_status(message: Message, app: AppState) -> None:
     await message.answer("<pre>" + html.escape(txt) + "</pre>")
 
 
+@router.message(Command("accstats"))
+async def cmd_accstats(message: Message, app: AppState) -> None:
+    """Статистика P&L по каждому счёту (реальные сделки). /accstats [YYYY-MM-DD|today]."""
+    if not _is_owner_private(message):
+        return
+    from .trades import build_account_stats
+    parts = (message.text or "").split()
+    session_date = None
+    if len(parts) >= 2:
+        arg = parts[1].strip().lower()
+        if arg == "today":
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo
+            session_date = _dt.now(tz=ZoneInfo(app.cfg.display_tz)).date().isoformat()
+        else:
+            session_date = parts[1].strip()
+    try:
+        txt = build_account_stats(app, session_date=session_date)
+    except Exception as e:
+        txt = f"Ошибка статистики по счетам: {html.escape(str(e))}"
+    await message.answer(txt, parse_mode="HTML")
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, app: AppState) -> None:
     cd_left = _cooldown_left_seconds(app)
@@ -586,6 +609,42 @@ async def cb_exec_confirm(cq: CallbackQuery, app: AppState) -> None:
         if res.order_id:
             txt += f"\norder_id: {res.order_id}"
         await cq.answer(f"{broker.cfg.label}: исполнено")
+        # ── Учёт РЕАЛЬНОЙ сделки по счёту (Этап A: статистика по счетам) ──
+        try:
+            from .trades import parse_tn_ticker
+            from .bot import _fetch_option_price
+            from datetime import datetime as _dt, timezone as _tz
+            if app.trade_journal is not None and po is not None:
+                now_utc = _dt.now(tz=_tz.utc)
+                sess = getattr(app.stats, "session_id", None) or now_utc.date().isoformat()
+                fill_price = await _fetch_option_price(app.tn, po.tn_ticker)
+                try:
+                    underlying = await app.tn.get_quote_ltp(app.cfg.symbol)
+                except Exception:
+                    underlying = None
+                if po.is_open:
+                    meta = parse_tn_ticker(po.tn_ticker)
+                    if meta is not None:
+                        app.trade_journal.open_trade(
+                            session_date=sess, option_type=meta["option_type"],
+                            ticker=po.tn_ticker, strike=meta["strike"], expiry=meta["expiry"],
+                            dte_at_entry=po.dte or 0, entry_price=fill_price,
+                            entry_underlying=float(underlying) if underlying else 0.0,
+                            entry_ts=now_utc, contracts=po.contracts,
+                            account_id=broker.cfg.account_id, entry_order_id=res.order_id,
+                        )
+                else:
+                    app.trade_journal.close_trade(
+                        ticker=po.tn_ticker, exit_price=fill_price,
+                        exit_underlying=float(underlying) if underlying else 0.0,
+                        exit_ts=now_utc, account_id=broker.cfg.account_id,
+                        exit_order_id=res.order_id,
+                    )
+        except Exception as e:
+            try:
+                app.stats.last_error = f"journal per-account: {repr(e)}"
+            except Exception:
+                pass
     else:
         txt = f"⚠️ <b>[{broker.cfg.label}] Не исполнено</b>\n{res.reason}"
         await cq.answer("Ошибка", show_alert=True)
