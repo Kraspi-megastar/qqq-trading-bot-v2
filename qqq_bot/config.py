@@ -223,6 +223,8 @@ def load_config() -> AppConfig:
         strike_step=float(os.getenv("OPTION_STRIKE_STEP", "1.0")),
         underlying_symbol=os.getenv("OPTION_UNDERLYING", "QQQ.US"),
         target_delta=float(os.getenv("OPTION_TARGET_DELTA", "0.375")),
+        delta_min_acceptable=float(os.getenv("OPTION_DELTA_MIN", "0.28")),
+        delta_max_acceptable=float(os.getenv("OPTION_DELTA_MAX", "0.45")),
         max_expiry_tries=int(os.getenv("OPTION_MAX_EXPIRY_TRIES", "4")),
         risk_free_rate=float(os.getenv("OPTION_RISK_FREE_RATE", "0.05")),
         require_validation=os.getenv("OPTION_REQUIRE_VALIDATION", "0") == "1",

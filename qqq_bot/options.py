@@ -27,6 +27,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
+import logging
 
 import aiohttp
 
@@ -36,6 +37,8 @@ from .greeks import (
     years_to_expiry,
     estimate_sigma_from_atr,
 )
+
+logger = logging.getLogger(__name__)
 
 
 OptionActionType = Literal["OPEN", "CLOSE", "HOLD"]
@@ -65,6 +68,10 @@ class OptionConfig:
     underlying_symbol: str = "QQQ.US"
     # Целевая дельта для выбора страйка
     target_delta: float = 0.375
+    # Приемлемый диапазон дельты. Если TraderNet не дал страйк с дельтой в этих
+    # границах — откатываемся на Black-Scholes (не берём кривой ATM ~0.5).
+    delta_min_acceptable: float = 0.28
+    delta_max_acceptable: float = 0.45
     # Сколько дней-кандидатов перебрать в поисках торгуемой экспирации
     max_expiry_tries: int = 8
     # Безрисковая ставка для Black-Scholes
@@ -277,16 +284,33 @@ async def _pick_strike_by_delta(
                 best_delta = d
             # ранний выход: попали в целевой диапазон 0.35–0.40
             if 0.34 <= d <= 0.41:
+                logger.info("strike pick: TraderNet strike=%.0f delta=%.3f (target %.3f, checked=%d) — точное попадание",
+                            cand, d, target, checked)
                 return float(cand), d, "tradernet"
             # ограничим число сетевых запросов
             if checked >= 8:
                 break
-        if best_strike is not None:
+        # Принимаем результат TraderNet ТОЛЬКО если дельта в приемлемом диапазоне.
+        # Иначе (например TraderNet вернул лишь ATM 0.5) — откат на Black-Scholes,
+        # который считает страйк для target корректно. Это чинит кейс,
+        # когда для OTM-страйков greeks не пришли, и бот брал дорогой ATM.
+        if (best_strike is not None and best_delta is not None
+                and cfg.delta_min_acceptable <= best_delta <= cfg.delta_max_acceptable):
+            logger.info("strike pick: TraderNet strike=%.0f delta=%.3f (target %.3f, checked=%d) — принят",
+                        best_strike, best_delta, target, checked)
             return float(best_strike), best_delta, "tradernet"
+        else:
+            logger.warning("strike pick: TraderNet дал delta=%s (страйк=%s, проверено=%d) вне диапазона "
+                           "[%.2f..%.2f] — откат на Black-Scholes",
+                           f"{best_delta:.3f}" if best_delta is not None else "None",
+                           f"{best_strike:.0f}" if best_strike is not None else "None",
+                           checked, cfg.delta_min_acceptable, cfg.delta_max_acceptable)
 
     # 2) Black-Scholes
     if t_years > 0 and atr is not None and atr > 0:
         actual_delta = bs_delta(option_type, spot, bs_strike, t_years, sigma, cfg.risk_free_rate)
+        logger.info("strike pick: Black-Scholes strike=%.0f delta=%.3f (target %.3f)",
+                    bs_strike, abs(actual_delta), target)
         return bs_strike, actual_delta, "black-scholes"
 
     # 3) Аппроксимация
