@@ -41,22 +41,10 @@ class SignalConfig:
     ema_trend_period: int = 200
 
 
-@dataclass(frozen=True)
-class OptionConfig:
-    """Настройки генерации опционных сигналов."""
-    enabled: bool = True
-    min_dte: int = 1               # минимум дней до экспирации
-    strike_step: float = 1.0       # шаг страйка ($1 для QQQ)
-    underlying_symbol: str = "QQQ.US"
-    target_delta: float = 0.375    # целевая дельта для выбора страйка (0.35–0.40)
-    max_expiry_tries: int = 8      # сколько дней перебрать в поисках торгуемой экспирации
-    risk_free_rate: float = 0.05   # безрисковая ставка для Black-Scholes
-    require_validation: bool = False  # True = не открывать без подтверждения TraderNet
-    max_dte: int = 4               # максимальный срок до экспирации (дней)
-    # Временные окна RTH (минуты от начала дня по ET); опционы только в основную сессию
-    open_blackout_min: int = 10    # не открывать первые N минут после 9:30
-    close_blackout_min: int = 15   # не открывать/закрывать за N минут до 16:00
-    force_close_min: int = 15      # принудительно закрывать за N минут до 16:00 (не держать ночь)
+# OptionConfig определён в options.py (единственный источник истины).
+# Раньше здесь был ДУБЛИКАТ класса — это приводило к рассинхрону при добавлении
+# полей. Теперь импортируем один класс, чтобы правки не расходились.
+from .options import OptionConfig
 
 
 @dataclass(frozen=True)

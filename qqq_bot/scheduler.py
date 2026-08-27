@@ -460,22 +460,8 @@ async def bootstrap_history(app: AppState) -> None:
 # ────────────────────────────────────────────────────────────────────────────
 
 def _option_cfg(cfg: AppConfig) -> OptionConfig:
-    """Конвертирует AppConfig.option в options.OptionConfig."""
-    o = cfg.option
-    return OptionConfig(
-        enabled=o.enabled,
-        min_dte=o.min_dte,
-        strike_step=o.strike_step,
-        underlying_symbol=o.underlying_symbol,
-        target_delta=getattr(o, "target_delta", 0.375),
-        max_expiry_tries=getattr(o, "max_expiry_tries", 4),
-        risk_free_rate=getattr(o, "risk_free_rate", 0.05),
-        require_validation=getattr(o, "require_validation", False),
-        max_dte=getattr(o, "max_dte", 4),
-        open_blackout_min=getattr(o, "open_blackout_min", 10),
-        close_blackout_min=getattr(o, "close_blackout_min", 15),
-        force_close_min=getattr(o, "force_close_min", 15),
-    )
+    """cfg.option уже является options.OptionConfig (дубликат класса устранён)."""
+    return cfg.option
 
 
 async def polling_loop(app: AppState, send_signal_cb) -> None:
