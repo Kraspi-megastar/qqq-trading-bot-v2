@@ -124,6 +124,7 @@ class Broker:
         self._orders_day = date.today()
         self.load_error: Optional[str] = None
         self._pending: dict[str, PendingOrder] = {}  # token → ожидающий ордер
+        self._mode_override: Optional[str] = None     # runtime-переключение режима (/mode)
 
         if cfg.enabled and cfg.public_key and cfg.private_key:
             try:
@@ -136,9 +137,20 @@ class Broker:
     # ── Состояние ────────────────────────────────────────────────────────────
 
     @property
+    def effective_mode(self) -> str:
+        """Режим с учётом runtime-переключения (/mode). Override приоритетнее env."""
+        return self._mode_override if self._mode_override is not None else self.cfg.mode
+
+    def set_mode(self, mode: str) -> None:
+        """Переключение режима на лету: 'auto' | 'semi_auto' | 'off'."""
+        if mode in ("auto", "semi_auto", "off"):
+            self._mode_override = mode
+
+    @property
     def available(self) -> bool:
-        """Готов ли брокер исполнять (клиент загружен, не остановлен)."""
-        return self._client is not None and not self._halted and self.cfg.enabled
+        """Готов ли брокер исполнять (клиент загружен, не остановлен, не off)."""
+        return (self._client is not None and not self._halted
+                and self.cfg.enabled and self.effective_mode != "off")
 
     def halt(self) -> None:
         """Стоп-кран: мгновенно блокирует любое исполнение."""
@@ -299,13 +311,13 @@ class Broker:
         order_kind = "MKT" if market else f"@ {limit_price:.2f}"
 
         # semi_auto: требуем явное подтверждение
-        if self.cfg.mode == "semi_auto" and not confirmed:
+        if self.effective_mode == "semi_auto" and not confirmed:
             return ExecResult(
                 ok=False, action="pending_confirm",
                 reason=f"{side} {contracts}× {tn_ticker} {order_kind} — требуется подтверждение",
             )
 
-        if self.cfg.mode == "off":
+        if self.effective_mode == "off":
             return ExecResult(ok=False, action="blocked", reason="режим off")
 
         # Отправка через SDK. place_order: отрицательный qty = продажа.
