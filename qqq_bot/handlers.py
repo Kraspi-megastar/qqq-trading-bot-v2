@@ -1617,3 +1617,84 @@ def _is_ct(action, slope, rs):
         return is_counter_trend(action, slope, thr)
     except Exception:
         return False
+
+
+@router.message(F.text.regexp(r"^/mode(?:\s|$)"))
+async def cmd_mode(message: Message, app: AppState) -> None:
+    """
+    /mode — режимы исполнения по счетам.
+      /mode                → показать режимы всех счетов
+      /mode TFOS auto      → TFOS в авто-исполнение (бот сам, без кнопок)
+      /mode OSTROV semi    → OSTROV в ручное (кнопки подтверждения)
+      /mode FFA off        → FFA выключить (не торговать)
+      /mode all semi       → все счета в ручное (быстрый возврат)
+    """
+    if not _is_owner_private(message):
+        return
+    import re as _re
+    brokers = list(getattr(app, "brokers", []) or [])
+    if not brokers:
+        await message.answer("Нет настроенных счетов исполнения.")
+        return
+
+    parts = (message.text or "").split()
+    # без аргументов — показать статус
+    if len(parts) == 1:
+        lines = ["⚙️ <b>Режимы исполнения по счетам</b>", ""]
+        for br in brokers:
+            m = br.effective_mode
+            icon = {"auto": "🤖", "semi_auto": "✋", "off": "⛔"}.get(m, "?")
+            name = {"auto": "АВТО", "semi_auto": "ручной", "off": "выкл"}.get(m, m)
+            halted = " (стоп-кран!)" if getattr(br, "_halted", False) else ""
+            lines.append(f"{icon} <b>{br.cfg.label}</b>: {name}{halted}")
+        lines.append("")
+        lines.append("<i>Переключить: /mode TFOS auto | semi | off</i>")
+        lines.append("<i>Все сразу: /mode all semi</i>")
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return
+
+    if len(parts) < 3:
+        await message.answer("Формат: /mode СЧЁТ auto|semi|off  (или /mode all semi)")
+        return
+
+    target = parts[1].strip().lower()
+    mode_arg = parts[2].strip().lower()
+    # нормализуем режим
+    mode_map = {"auto": "auto", "semi": "semi_auto", "semi_auto": "semi_auto",
+                "manual": "semi_auto", "ручной": "semi_auto", "off": "off", "выкл": "off"}
+    mode = mode_map.get(mode_arg)
+    if mode is None:
+        await message.answer("Режим должен быть: auto, semi (ручной) или off.")
+        return
+
+    # выбор счетов
+    if target == "all":
+        targets = brokers
+    else:
+        targets = [b for b in brokers if b.cfg.account_id.lower() == target
+                   or b.cfg.label.lower() == target]
+        if not targets:
+            avail = ", ".join(b.cfg.label for b in brokers)
+            await message.answer(f"Счёт «{parts[1]}» не найден. Доступны: {avail}")
+            return
+
+    # применяем
+    changed = []
+    for br in targets:
+        br.set_mode(mode)
+        changed.append(br.cfg.label)
+
+    name = {"auto": "АВТО 🤖", "semi_auto": "ручной ✋", "off": "выкл ⛔"}[mode]
+    txt = [f"✅ Режим изменён: <b>{', '.join(changed)}</b> → {name}", ""]
+    if mode == "auto":
+        txt.append("⚠️ <b>ВНИМАНИЕ:</b> в режиме АВТО бот исполняет сделки "
+                   "САМ, без подтверждения. Стопы и лимиты работают. "
+                   "Останов: /halt (стоп-кран) или /mode ... semi.")
+    # покажем итоговую картину
+    txt.append("")
+    for br in brokers:
+        m = br.effective_mode
+        icon = {"auto": "🤖", "semi_auto": "✋", "off": "⛔"}.get(m, "?")
+        nm = {"auto": "АВТО", "semi_auto": "ручной", "off": "выкл"}.get(m, m)
+        txt.append(f"{icon} {br.cfg.label}: {nm}")
+    await message.answer("\n".join(txt), parse_mode="HTML")

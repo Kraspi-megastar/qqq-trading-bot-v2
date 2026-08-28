@@ -36,6 +36,40 @@ def _fmt_ts_z(dt) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt is not None else "-"
 
 
+async def _journal_auto_fill(app, br, rec, side: str, contracts: int,
+                             price: float, res) -> None:
+    """Журналирует авто-сделку по счёту (аналог semi_auto в cb_exec_confirm)."""
+    from .trades import parse_tn_ticker
+    from datetime import datetime as _dt, timezone as _tz
+    if app.trade_journal is None:
+        return
+    now_utc = _dt.now(tz=_tz.utc)
+    sess = getattr(app.stats, "session_id", None) or now_utc.date().isoformat()
+    try:
+        underlying = await app.tn.get_quote_ltp(app.cfg.symbol)
+    except Exception:
+        underlying = None
+    is_open = rec.action_type == "OPEN"
+    if is_open:
+        meta = parse_tn_ticker(rec.tn_ticker)
+        if meta is not None:
+            app.trade_journal.open_trade(
+                session_date=sess, option_type=meta["option_type"],
+                ticker=rec.tn_ticker, strike=meta["strike"], expiry=meta["expiry"],
+                dte_at_entry=rec.dte or 0, entry_price=price,
+                entry_underlying=float(underlying) if underlying else 0.0,
+                entry_ts=now_utc, contracts=contracts,
+                account_id=br.cfg.account_id, entry_order_id=res.order_id,
+            )
+    else:
+        app.trade_journal.close_trade(
+            ticker=rec.tn_ticker, exit_price=price,
+            exit_underlying=float(underlying) if underlying else 0.0,
+            exit_ts=now_utc, account_id=br.cfg.account_id,
+            exit_order_id=res.order_id,
+        )
+
+
 async def _fetch_option_price(tn: TraderNetClient, tn_ticker: str) -> float | None:
     try:
         q = await asyncio.wait_for(tn.get_option_quote(tn_ticker), timeout=8.0)
@@ -157,8 +191,10 @@ async def _send_signal_to_channel(
                 keyboard_rows = []
                 any_offer = False
                 for br in app.brokers:
-                    if not br.available or br.cfg.mode != "semi_auto":
+                    # Обрабатываем и semi_auto (кнопка), и auto (сразу). off/недоступные — пропуск.
+                    if not br.available or br.effective_mode not in ("semi_auto", "auto"):
                         continue
+                    is_auto = br.effective_mode == "auto"
                     label = br.cfg.label
                     if rec.action_type == "OPEN":
                         acct_val = br.purchasing_power() or 0.0
@@ -209,16 +245,35 @@ async def _send_signal_to_channel(
                         # рынок уходит). Обычные закрытия/открытия — лимитные.
                         use_market = (rec.action_type == "CLOSE"
                                       and getattr(rec, "delta_source", "") in ("stop_loss", "force_close"))
-                        po = br.create_pending(
-                            tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
-                            limit_price=price, dte=rec.dte, is_open=(rec.action_type == "OPEN"),
-                            market=use_market,
-                        )
-                        # callback data: exec_ok:{account_id}:{token}
-                        from .handlers import build_account_confirm_row
-                        keyboard_rows += build_account_confirm_row(br.cfg.account_id, label, po.token)
-                        lines += ["", f"🎯 <b>{label}</b>: {po.human}"]
-                        any_offer = True
+                        if is_auto:
+                            # АВТО: исполняем сразу, без кнопки. Отчёт о результате.
+                            res = br.place_option_order(
+                                tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
+                                limit_price=price, dte=rec.dte,
+                                is_open=(rec.action_type == "OPEN"),
+                                market=use_market, confirmed=True,
+                            )
+                            if res.ok:
+                                oid = f" (order_id {res.order_id})" if res.order_id else ""
+                                lines += ["", f"🤖 <b>АВТО [{label}]</b>: {html.escape(res.reason)}{oid}"]
+                                # журналируем авто-сделку по счёту
+                                try:
+                                    await _journal_auto_fill(app, br, rec, side, contracts, price, res)
+                                except Exception as _je:
+                                    app.stats.last_error = f"journal auto: {repr(_je)}"
+                            else:
+                                lines += ["", f"⚠️ <b>АВТО [{label}]</b>: не исполнено — {html.escape(res.reason)}"]
+                        else:
+                            # SEMI_AUTO: кнопка подтверждения (как раньше).
+                            po = br.create_pending(
+                                tn_ticker=rec.tn_ticker, side=side, contracts=contracts,
+                                limit_price=price, dte=rec.dte, is_open=(rec.action_type == "OPEN"),
+                                market=use_market,
+                            )
+                            from .handlers import build_account_confirm_row
+                            keyboard_rows += build_account_confirm_row(br.cfg.account_id, label, po.token)
+                            lines += ["", f"🎯 <b>{label}</b>: {po.human}"]
+                            any_offer = True
                     else:
                         # Подробная причина: сколько денег, почём контракт, какой %
                         detail = ""
@@ -350,6 +405,7 @@ async def _setup_command_menus(bot, app) -> None:
         ("positions", "Открытые позиции"),
         ("orders", "Активные ордера"),
         ("exec_status", "Статус исполнения"),
+        ("mode", "🤖 Режим счетов: /mode TFOS auto"),
         ("halt", "СТОП-КРАН"),
         ("resume", "Снять стоп-кран"),
         ("panic", "🚨 Аварийный выход (закрыть по рынку)"),
