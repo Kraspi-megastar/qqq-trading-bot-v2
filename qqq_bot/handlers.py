@@ -1445,14 +1445,22 @@ async def cb_cancel_no(cq: CallbackQuery, app: AppState) -> None:
         pass
 
 
-@router.message(Command("diag"))
+@router.message(F.text.regexp(r"^/diag(?:[12#_ ]|$)"))
 async def cmd_diag(message: Message, app: AppState) -> None:
-    """/diag — рентген индикаторов: почему сейчас нет сигнала (условия #1 + фильтр)."""
+    """/diag — рентген индикаторов активной стратегии. /diag 2 — как бы торговала #2."""
     if not _is_owner_private(message):
         return
     import pandas as pd
+    import re as _re
     from .pipeline import bars_to_df, add_indicators, min_bars_for_indicators
     from .signals import compute_signal, Strategy2State
+
+    # какую стратегию диагностировать: /diag → активная; /diag 1|2 → принудительно
+    txt = (message.text or "").strip()
+    m = _re.search(r"^/diag(?:#|_|\s+)?([12])?\s*$", txt)
+    forced = int(m.group(1)) if (m and m.group(1)) else None
+    active = app.strategy_id
+    which = forced if forced is not None else active
 
     s = app.cfg.signal
     bars = app.cache.to_list()
@@ -1463,31 +1471,14 @@ async def cmd_diag(message: Message, app: AppState) -> None:
 
     tail = bars[-(app.cfg.chart_bars + 10):]
     df = add_indicators(bars_to_df(tail), app.cfg)
-    # сигнал по ЗАКРЫТОМУ бару (как в боте)
     df_sig = add_indicators(df.iloc[:-1].copy(), app.cfg)
     row = df_sig.iloc[-1]
 
     def fv(col):
         try:
-            v = float(row[col])
-            return v if v == v else None  # отсеять NaN
+            v = float(row[col]); return v if v == v else None
         except Exception:
             return None
-
-    price = fv("close"); rsi = fv("rsi")
-    ema_f = fv("ema_fast"); ema_s = fv("ema_slow")
-    bb_l = fv("bb_lower"); bb_m = fv("bb_mid"); bb_u = fv("bb_upper")
-
-    # воспроизводим условия #1 (как в signals.py)
-    ema_up = ema_f is not None and ema_s is not None and ema_f > ema_s
-    ema_dn = ema_f is not None and ema_s is not None and ema_f < ema_s
-    thr = price * float(s.near_bb_tol) if price else 0
-    nearL = price is not None and bb_l is not None and bb_m is not None and (price - bb_l) <= thr and price <= bb_m
-    nearU = price is not None and bb_u is not None and bb_m is not None and (bb_u - price) <= thr and price >= bb_m
-
-    dec = compute_signal(df_sig, s, strategy_id=1)
-    buy_score = dec.details.get("buy_score", 0)
-    sell_score = dec.details.get("sell_score", 0)
 
     def mark(b): return "✅" if b else "▫️"
 
@@ -1497,75 +1488,132 @@ async def cmd_diag(message: Message, app: AppState) -> None:
     except Exception:
         et_ts = str(et_ts)
 
-    lines = [f"🔬 <b>Диагностика сигнала</b> (бар {et_ts} ET)", ""]
-    lines.append(f"QQQ: <b>{price:.2f}</b>" if price else "QQQ: н/д")
-    lines.append(f"RSI(14): <b>{rsi:.1f}</b>" if rsi is not None else "RSI: н/д")
-    lines.append(f"EMA9/21: {ema_f:.2f} / {ema_s:.2f}" if ema_f and ema_s else "EMA: н/д")
-    if bb_l and bb_m and bb_u:
-        lines.append(f"BB: L={bb_l:.2f} M={bb_m:.2f} U={bb_u:.2f}")
-    lines.append("")
+    price = fv("close"); rsi = fv("rsi")
 
-    # условия BUY (CALL)
-    lines.append("<b>Условия BUY (CALL):</b>")
-    lines.append(f"  {mark(ema_up)} EMA9&gt;EMA21 (тренд вверх)")
-    lines.append(f"  {mark(nearL)} цена у нижней BB")
-    rsi_buy_ok = nearL and rsi is not None and rsi <= float(s.rsi_buy)
-    lines.append(f"  {mark(rsi_buy_ok)} RSI≤{s.rsi_buy:.0f} у нижней BB (RSI={rsi:.0f})" if rsi is not None else "  ▫️ RSI н/д")
-    lines.append(f"  → buy_score = <b>{buy_score}/3</b> (нужно ≥2 + RSI обязателен)")
-    lines.append("")
-    # условия SELL (PUT)
-    lines.append("<b>Условия SELL (PUT):</b>")
-    lines.append(f"  {mark(ema_dn)} EMA9&lt;EMA21 (тренд вниз)")
-    lines.append(f"  {mark(nearU)} цена у верхней BB")
-    rsi_sell_ok = nearU and rsi is not None and rsi >= float(s.rsi_sell)
-    lines.append(f"  {mark(rsi_sell_ok)} RSI≥{s.rsi_sell:.0f} у верхней BB (RSI={rsi:.0f})" if rsi is not None else "  ▫️ RSI н/д")
-    lines.append(f"  → sell_score = <b>{sell_score}/3</b> (нужно ≥2 + RSI обязателен)")
-    lines.append("")
-
-    # фильтр тренда 1h
+    # шапка: какая стратегия активна, что показываем, статусы
     rs = getattr(app, "settings", None)
+    router_on = rs is not None and getattr(rs, "router_on", False)
     filter_on = rs is not None and getattr(rs, "htf_filter_on", False)
-    thr_slope = float(getattr(rs, "htf_slope_threshold", 0.45)) if rs else 0.45
-    filt_line = ""
-    if filter_on:
+    header = [f"🔬 <b>Диагностика #{which}</b> (бар {et_ts} ET)"]
+    note = f"активная стратегия: #{active}"
+    if router_on:
+        note += ", роутер вкл"
+    if forced is not None and forced != active:
+        note += f" — показываю #{forced} для наблюдения (в бой не идёт)"
+    header.append(f"<i>{note}</i>")
+    header.append("")
+    header.append(f"QQQ: <b>{price:.2f}</b>  RSI: <b>{rsi:.1f}</b>" if price and rsi is not None else "данные н/д")
+    header.append("")
+
+    lines = header
+
+    if which == 1:
+        # ── Диагностика #1 (BB + EMA + RSI, контртрендовая) ──
+        ema_f = fv("ema_fast"); ema_s = fv("ema_slow")
+        bb_l = fv("bb_lower"); bb_m = fv("bb_mid"); bb_u = fv("bb_upper")
+        ema_up = ema_f is not None and ema_s is not None and ema_f > ema_s
+        ema_dn = ema_f is not None and ema_s is not None and ema_f < ema_s
+        thr = price * float(s.near_bb_tol) if price else 0
+        nearL = price is not None and bb_l is not None and bb_m is not None and (price - bb_l) <= thr and price <= bb_m
+        nearU = price is not None and bb_u is not None and bb_m is not None and (bb_u - price) <= thr and price >= bb_m
+        dec = compute_signal(df_sig, s, strategy_id=1)
+        buy_score = dec.details.get("buy_score", 0); sell_score = dec.details.get("sell_score", 0)
+        if ema_f and ema_s:
+            lines.append(f"EMA9/21: {ema_f:.2f} / {ema_s:.2f}")
+        if bb_l and bb_m and bb_u:
+            lines.append(f"BB: L={bb_l:.2f} M={bb_m:.2f} U={bb_u:.2f}")
+        lines.append("")
+        lines.append("<b>BUY (CALL):</b>")
+        lines.append(f"  {mark(ema_up)} EMA9&gt;EMA21")
+        lines.append(f"  {mark(nearL)} цена у нижней BB")
+        rsi_buy_ok = nearL and rsi is not None and rsi <= float(s.rsi_buy)
+        lines.append(f"  {mark(rsi_buy_ok)} RSI≤{s.rsi_buy:.0f} у нижней BB")
+        lines.append(f"  → buy_score = <b>{buy_score}/3</b> (нужно ≥2 + RSI)")
+        lines.append("")
+        lines.append("<b>SELL (PUT):</b>")
+        lines.append(f"  {mark(ema_dn)} EMA9&lt;EMA21")
+        lines.append(f"  {mark(nearU)} цена у верхней BB")
+        rsi_sell_ok = nearU and rsi is not None and rsi >= float(s.rsi_sell)
+        lines.append(f"  {mark(rsi_sell_ok)} RSI≥{s.rsi_sell:.0f} у верхней BB")
+        lines.append(f"  → sell_score = <b>{sell_score}/3</b> (нужно ≥2 + RSI)")
+    else:
+        # ── Диагностика #2 (MACD + VWAP + Supertrend + RSI, трендследящая) ──
+        dec = compute_signal(df_sig, s, strategy_id=2, state=Strategy2State(**app.strategy2.__dict__))
+        d = dec.details
+        vwap = d.get("vwap"); macd = d.get("macd"); macd_sig = d.get("macd_signal")
+        st_dir = d.get("supertrend_dir")
+        lines.append(f"VWAP: {vwap:.2f}" if vwap else "VWAP: н/д")
+        lines.append(f"MACD: {macd:+.3f} | signal: {macd_sig:+.3f}" if macd is not None and macd_sig is not None else "MACD: н/д")
+        lines.append(f"Supertrend: {'↑ вверх' if st_dir == 1 else ('↓ вниз' if st_dir == -1 else '?')}")
+        lines.append("")
+        lines.append("<b>BUY (CALL) — нужны ВСЕ:</b>")
+        lines.append(f"  {mark(d.get('macd_cross_up'))} MACD пересёк сигнал вверх")
+        lines.append(f"  {mark(macd is not None and macd > 0)} MACD &gt; 0 (бычий импульс)")
+        lines.append(f"  {mark(d.get('above_vwap'))} цена &gt; VWAP")
+        lines.append(f"  {mark(rsi is not None and rsi > 50)} RSI &gt; 50")
+        lines.append(f"  {mark(d.get('st_up'))} Supertrend ↑")
+        lines.append(f"  {mark(d.get('trend_ok'))} цена &gt; EMA200")
+        lines.append(f"  {mark(d.get('vol_ok'))} объём выше среднего")
+        lines.append("")
+        lines.append("<b>SELL (PUT) — зеркально:</b>")
+        lines.append(f"  {mark(d.get('macd_cross_down'))} MACD пересёк сигнал вниз")
+        lines.append(f"  {mark(macd is not None and macd < 0)} MACD &lt; 0 (медвежий импульс)")
+        lines.append(f"  {mark(d.get('below_vwap'))} цена &lt; VWAP + RSI&lt;50 + ST↓ + фильтры")
+        cur_pos = app.strategy2.position if which == active else "FLAT"
+        if cur_pos and cur_pos != "FLAT":
+            lines.append("")
+            lines.append(f"<i>Сейчас #2 в позиции: {cur_pos}</i>")
+
+    lines.append("")
+
+    # фильтр тренда 1h (общий)
+    slope = None
+    if filter_on or router_on:
         try:
             from .htf_filter import compute_htf_trend, is_counter_trend
+            thr_slope = float(getattr(rs, "htf_slope_threshold", 0.45))
             slope, _ = compute_htf_trend(df_sig, ema_period=20, slope_hours=3)
-            lines.append(f"<b>Фильтр тренда 1h:</b> вкл (порог {thr_slope:.2f})")
-            lines.append(f"  наклон 1h = <b>{slope:+.2f}</b>")
-            # если бы сигнал был — заблокировал бы?
-            if dec.action in ("BUY", "SELL"):
-                blocked = is_counter_trend(dec.action, slope, thr_slope)
-                filt_line = ("⛔ сигнал есть, но фильтр его БЛОКИРУЕТ (против тренда)"
-                             if blocked else "✅ сигнал есть и проходит фильтр")
-            else:
-                if abs(slope) > thr_slope:
-                    filt_line = f"тренд есть (|{slope:.2f}|&gt;{thr_slope}) → контртрендовые входы #1 блокируются"
-                else:
-                    filt_line = f"боковик (|{slope:.2f}|≤{thr_slope}) → #1 разрешена, ждём касания BB+RSI"
+            lines.append(f"<b>Фильтр тренда 1h:</b> вкл (порог {thr_slope:.2f}), наклон = <b>{slope:+.2f}</b>")
+            if which == 1 and dec.action in ("BUY", "SELL"):
+                blk = is_counter_trend(dec.action, slope, thr_slope)
+                lines.append("⛔ сигнал #1 против тренда — БЛОКИРУЕТСЯ" if blk else "✅ сигнал #1 проходит фильтр")
         except Exception as e:
-            lines.append(f"<b>Фильтр 1h:</b> ошибка расчёта: {html.escape(str(e))}")
+            lines.append(f"<b>Фильтр 1h:</b> ошибка: {html.escape(str(e))}")
     else:
         lines.append("<b>Фильтр тренда 1h:</b> выкл")
     lines.append("")
 
-    # ВЕРДИКТ
+    # вердикт
     lines.append("<b>Вердикт:</b>")
-    if dec.action == "BUY" and not (filter_on and filt_line.startswith("⛔")):
-        lines.append("🟢 Есть сигнал BUY (CALL) — должен прийти.")
-    elif dec.action == "SELL" and not (filter_on and filt_line.startswith("⛔")):
-        lines.append("🔴 Есть сигнал SELL (PUT) — должен прийти.")
-    elif dec.action in ("BUY", "SELL") and filt_line.startswith("⛔"):
-        lines.append(f"⛔ Сигнал есть, но заблокирован фильтром.\n{filt_line}")
+    if dec.action == "BUY":
+        blocked = which == 1 and filter_on and slope is not None and _is_ct(dec.action, slope, rs)
+        lines.append("⛔ Сигнал BUY есть, но фильтр блокирует." if blocked else "🟢 Есть сигнал BUY (CALL).")
+    elif dec.action == "SELL":
+        blocked = which == 1 and filter_on and slope is not None and _is_ct(dec.action, slope, rs)
+        lines.append("⛔ Сигнал SELL есть, но фильтр блокирует." if blocked else "🔴 Есть сигнал SELL (PUT).")
+    elif "EXIT" in dec.reason:
+        lines.append(f"🚪 #2 сигнал на выход: {html.escape(dec.reason)}")
     else:
-        # нет сигнала — объясняем чего не хватает
-        if buy_score < 2 and sell_score < 2:
-            lines.append("⏳ Сигнала нет: рынок не у границ BB / RSI не в зоне.")
-            lines.append("Условия входа не сложились — это нормальное ожидание, не поломка.")
-        elif buy_score >= 1 or sell_score >= 1:
-            near = "BUY (низ BB)" if buy_score >= sell_score else "SELL (верх BB)"
-            lines.append(f"⏳ Близко к {near}, но не хватает подтверждений (нужно ≥2 + RSI).")
-        if filt_line and not filt_line.startswith("✅"):
-            lines.append(filt_line)
+        if which == 1:
+            bs = dec.details.get("buy_score", 0); ss = dec.details.get("sell_score", 0)
+            if bs < 2 and ss < 2:
+                lines.append("⏳ Сигнала нет: рынок не у границ BB / RSI не в зоне. Это норма, не поломка.")
+            else:
+                near = "BUY (низ BB)" if bs >= ss else "SELL (верх BB)"
+                lines.append(f"⏳ Близко к {near}, не хватает подтверждений (нужно ≥2 + RSI).")
+        else:
+            lines.append("⏳ #2: условия входа не сложились (нужно совпадение MACD+VWAP+ST+RSI+объём).")
+        if forced is not None and forced != active:
+            lines.append(f"<i>(это наблюдение за #{forced}, реально активна #{active})</i>")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+def _is_ct(action, slope, rs):
+    """Хелпер: заблокировал бы фильтр этот сигнал #1?"""
+    try:
+        from .htf_filter import is_counter_trend
+        thr = float(getattr(rs, "htf_slope_threshold", 0.45)) if rs else 0.45
+        return is_counter_trend(action, slope, thr)
+    except Exception:
+        return False
