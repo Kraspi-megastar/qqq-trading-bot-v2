@@ -228,8 +228,13 @@ class TradeJournal:
 def build_day_report(app, public: bool = False) -> str:
     """
     Дневной отчёт по опционным сделкам за сегодня.
-    public=False → полный ($, для закрытого канала).
-    public=True  → на 1 контракт ($ и %, для открытого канала).
+    public=False → полный, С РАЗБИВКОЙ ПО СЧЕТАМ (для закрытого канала).
+    public=True  → на 1 контракт, по СИГНАЛУ (для открытого канала).
+
+    Важно: одна сделка журналируется и на сигнальном уровне ("signal"),
+    и по каждому счёту (tfos/ostrov/...). Поэтому:
+      - публичный отчёт берёт ТОЛЬКО signal-записи (одна на сигнал, без дублей);
+      - закрытый отчёт группирует по РЕАЛЬНЫМ счетам (signal исключаем).
     """
     import html as _html
     from datetime import datetime
@@ -240,23 +245,21 @@ def build_day_report(app, public: bool = False) -> str:
 
     tz = ZoneInfo(app.cfg.display_tz)
     today_str = datetime.now(tz=tz).date().isoformat()
-    closed = app.trade_journal.closed_trades(session_date=today_str, limit=200)
-    with_pnl = [t for t in closed if t.pnl() is not None]
-    wins = [t for t in with_pnl if (t.pnl() or 0) > 0]
-    losses = [t for t in with_pnl if (t.pnl() or 0) <= 0]
-    win_rate = f"{len(wins)/len(with_pnl)*100:.0f}%" if with_pnl else "n/a"
+    journal = app.trade_journal
 
     if public:
-        # Публичная версия: суммы «на 1 контракт» (делим на число контрактов),
-        # показываем $ и %. Без абсолютных размеров позиции.
+        # ── ПУБЛИЧНЫЙ: только сигнальный уровень, на 1 контракт ──
+        sig = [t for t in journal.closed_trades(session_date=today_str, limit=500,
+                                                account_id="signal")
+               if t.pnl() is not None]
+        wins = [t for t in sig if (t.pnl() or 0) > 0]
+        losses = [t for t in sig if (t.pnl() or 0) <= 0]
+        wr = f"{len(wins)/len(sig)*100:.0f}%" if sig else "n/a"
         lines = [f"📋 <b>Итоги дня — {today_str}</b>", ""]
-        lines.append(f"Сделок: {len(with_pnl)} | ✅ {len(wins)} / ❌ {len(losses)} | винрейт {win_rate}")
-
-        # Суммарный результат за день В РАСЧЁТЕ НА 1 КОНТРАКТ и средняя доходность
-        if with_pnl:
-            total_per1 = 0.0
-            pct_list = []
-            for t in with_pnl:
+        lines.append(f"Сигналов: {len(sig)} | ✅ {len(wins)} / ❌ {len(losses)} | винрейт {wr}")
+        if sig:
+            total_per1 = 0.0; pct_list = []
+            for t in sig:
                 n = getattr(t, "contracts", 1) or 1
                 total_per1 += (t.pnl() or 0.0) / n
                 pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
@@ -268,45 +271,67 @@ def build_day_report(app, public: bool = False) -> str:
             lines.append(f"{sign_tot} <b>Итог за день (на 1 контракт): ${total_per1:+.0f}</b>")
             if avg_pct is not None:
                 lines.append(f"Средняя доходность по сделкам: {avg_pct:+.1f}%")
-
-        lines.append("")
-        for t in with_pnl:
-            pnl = t.pnl() or 0.0
-            # на 1 контракт
-            n = getattr(t, "contracts", 1) or 1
-            per1 = pnl / n
-            pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
-            pct_str = f" ({pct:+.0f}%)" if pct is not None else ""
-            sign = "🟢" if pnl > 0 else "🔴"
-            lines.append(f"{sign} {t.option_type} ${per1:+.0f}{pct_str}")
-        if not with_pnl:
-            lines.append("Закрытых сделок за день нет.")
+            lines.append("")
+            for t in sig:
+                n = getattr(t, "contracts", 1) or 1
+                per1 = (t.pnl() or 0.0) / n
+                pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
+                pct_str = f" ({pct:+.0f}%)" if pct is not None else ""
+                sign = "🟢" if (t.pnl() or 0) > 0 else "🔴"
+                lines.append(f"{sign} {t.option_type} ${per1:+.0f}{pct_str}")
+        else:
+            lines.append("")
+            lines.append("Сигналов с закрытием за день нет.")
         return "\n".join(lines)
 
-    # Полная версия (закрытый канал)
-    total_pnl = sum(t.pnl() for t in with_pnl) if with_pnl else 0.0
-    avg_pnl = total_pnl / len(with_pnl) if with_pnl else None
-    lines = [
-        f"📋 <b>Дневной отчёт QQQ — {today_str}</b>",
-        "",
-        f"Закрытых сделок: {len(closed)} (с P/L: {len(with_pnl)})",
-        f"Win/Loss: {len(wins)} / {len(losses)}  |  Win rate: {win_rate}",
-        f"Итоговый P/L: ${total_pnl:.2f}",
-        f"Средний P/L: {'${:.2f}'.format(avg_pnl) if avg_pnl is not None else 'n/a'}",
-    ]
-    if with_pnl:
-        lines.append("")
-        for t in with_pnl:
+    # ── ЗАКРЫТЫЙ: разбивка по РЕАЛЬНЫМ счетам ──
+    accounts = [a for a in journal.accounts_seen() if a != "signal"]
+    lines = [f"📋 <b>Дневной отчёт QQQ — {today_str}</b>", ""]
+
+    if not accounts:
+        # реальных сделок по счетам ещё нет — покажем сигнальный уровень как справку
+        sig = [t for t in journal.closed_trades(session_date=today_str, limit=500,
+                                                account_id="signal") if t.pnl() is not None]
+        if not sig:
+            lines.append("Сделок за день нет.")
+            return "\n".join(lines)
+        total = sum(t.pnl() or 0 for t in sig)
+        w = sum(1 for t in sig if (t.pnl() or 0) > 0)
+        lines.append("<i>Реальных сделок по счетам нет — показан сигнальный уровень.</i>")
+        lines.append(f"Сигналов: {len(sig)} | ✅ {w} / ❌ {len(sig)-w}")
+        lines.append(f"Итог (сигнал, на позицию): ${total:+.2f}")
+        return "\n".join(lines)
+
+    grand_total = 0.0; grand_n = 0
+    for acc in accounts:
+        trades = [t for t in journal.closed_trades(session_date=today_str, limit=500,
+                                                   account_id=acc) if t.pnl() is not None]
+        if not trades:
+            continue
+        wins = [t for t in trades if (t.pnl() or 0) > 0]
+        losses = [t for t in trades if (t.pnl() or 0) <= 0]
+        total = sum(t.pnl() or 0 for t in trades)
+        wr = f"{len(wins)/len(trades)*100:.0f}%" if trades else "n/a"
+        grand_total += total; grand_n += len(trades)
+        sign = "🟢" if total >= 0 else "🔴"
+        lines.append(f"{sign} <b>[{acc}]</b> — {len(trades)} сд. | ✅{len(wins)}/❌{len(losses)} | {wr}")
+        lines.append(f"    P/L счёта: <b>${total:+.2f}</b>")
+        for t in trades:
             pnl = t.pnl() or 0.0
             pct = t.pnl_pct() if hasattr(t, "pnl_pct") else None
             pct_str = f" ({pct:+.0f}%)" if pct is not None else ""
-            sign = "🟢" if pnl > 0 else "🔴"
+            s2 = "🟢" if pnl > 0 else "🔴"
             n = getattr(t, "contracts", 1) or 1
-            lines.append(f"{sign} {t.option_type} {n}× → ${pnl:+.2f}{pct_str}")
-    if not closed:
+            lines.append(f"    {s2} {t.option_type} {n}× → ${pnl:+.2f}{pct_str}")
         lines.append("")
-        lines.append("Сделок за дату нет или они ещё не закрыты.")
+
+    if grand_n > 0:
+        gsign = "🟢" if grand_total >= 0 else "🔴"
+        lines.append(f"{gsign} <b>ИТОГО по всем счетам: ${grand_total:+.2f}</b> ({grand_n} сделок)")
+    else:
+        lines.append("Реальных закрытых сделок по счетам за день нет.")
     return "\n".join(lines)
+
 
 
 def build_day_report_public(app) -> str:
